@@ -220,7 +220,10 @@ struct OptState {
         gamma = gamma_;
         size_t nb = d.blds.size();
         need.resize(nb);
-        for (size_t b = 0; b < nb; b++) need[b] = tau * d.blds[b].perimeter;
+        // +1mm slack: guards against float32 interval rounding so that every
+        // claimed building clears the exact threshold with margin
+        for (size_t b = 0; b < nb; b++)
+            need[b] = tau * d.blds[b].perimeter + 1e-3;
         cov.assign(nb, {});
         served.assign(nb, 0);
         touch.assign(nb, {});
@@ -541,7 +544,7 @@ int main(int argc, char** argv) {
     std::string outDir = "results";
     std::string visCache;
     int nthreads = (int)std::thread::hardware_concurrency();
-    bool testvis = false;
+    bool testvis = false, witness = false;
     double tvx = 0, tvy = 0, tvR = 0;
 
     for (int i = 2; i < argc; i++) {
@@ -554,6 +557,7 @@ int main(int argc, char** argv) {
         else if (is("--threads")) nthreads = std::atoi(argv[++i]);
         else if (is("--out")) outDir = argv[++i];
         else if (is("--viscache")) visCache = argv[++i];
+        else if (is("--witness")) witness = true;
         else if (is("--taus")) taus = parseList(argv[++i]);
         else if (is("--ks")) {
             ks.clear();
@@ -650,6 +654,30 @@ int main(int argc, char** argv) {
                              (long long)ds.blds[sv[i]].id);
             std::fprintf(f, "\n");
             std::fclose(f);
+
+            if (witness) {
+                // certificate: for each served building, the antenna intervals
+                // (antenna index = position in the coordinate list) covering it
+                std::snprintf(path, sizeof path, "%s/wit_t%g_k%d.txt",
+                              outDir.c_str(), tau, k);
+                FILE* wf = std::fopen(path, "w");
+                std::map<uint32_t, size_t> selPos;
+                for (size_t i = 0; i < st.selected.size(); i++)
+                    selPos[st.selected[i]] = i;
+                for (uint32_t b : sv) {
+                    std::fprintf(wf, "%lld %.17g %.17g", (long long)ds.blds[b].id,
+                                 ds.blds[b].perimeter, st.need[b]);
+                    for (uint32_t a : st.touch[b]) {
+                        auto [s, e] = st.colOn(a, b);
+                        for (uint64_t j = s; j < e; j++)
+                            std::fprintf(wf, " %zu:%.9g:%.9g", selPos[a],
+                                         (double)vt.data[j].t0,
+                                         (double)vt.data[j].t1);
+                    }
+                    std::fprintf(wf, "\n");
+                }
+                std::fclose(wf);
+            }
         }
     }
     return 0;
