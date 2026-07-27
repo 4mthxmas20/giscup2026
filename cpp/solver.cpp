@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <map>
 #include <queue>
 #include <thread>
 
@@ -198,34 +199,49 @@ struct IvUnion {
     }
 };
 
-struct GreedyResult {
-    std::vector<uint32_t> picks;                    // candidate indices, in order
-    // snapshots[k] = serviced building indices right after pick #k
-    std::vector<std::pair<int, std::vector<uint32_t>>> snapshots;
-};
+// Mutable optimization state for one tau. Supports add/remove of antennas
+// with exact per-building covered-interval unions.
+struct OptState {
+    const Dataset* ds = nullptr;
+    const VisTable* vt = nullptr;
+    double tau = 0, gamma = 0;
+    std::vector<double> need;
+    std::vector<IvUnion> cov;
+    std::vector<uint8_t> served;
+    std::vector<std::vector<uint32_t>> touch;  // building -> selected cands
+    std::vector<uint8_t> isSel;
+    std::vector<uint32_t> selected;
+    int score = 0;
 
-static void runGreedy(const Dataset& ds, const std::vector<Candidate>& cands,
-                      const VisTable& vt, double tau, const std::vector<int>& ks,
-                      double gamma, int nthreads, GreedyResult& res) {
-    size_t nb = ds.blds.size(), nc = cands.size();
-    std::vector<double> need(nb);
-    for (size_t b = 0; b < nb; b++) need[b] = tau * ds.blds[b].perimeter;
-    std::vector<IvUnion> cov(nb);
-    std::vector<uint8_t> served(nb, 0);
+    void init(const Dataset& d, const VisTable& v, double tau_, double gamma_) {
+        ds = &d;
+        vt = &v;
+        tau = tau_;
+        gamma = gamma_;
+        size_t nb = d.blds.size();
+        need.resize(nb);
+        for (size_t b = 0; b < nb; b++) need[b] = tau * d.blds[b].perimeter;
+        cov.assign(nb, {});
+        served.assign(nb, 0);
+        touch.assign(nb, {});
+        isSel.assign(v.off.size() - 1, 0);
+        selected.clear();
+        score = 0;
+    }
 
-    auto gainOf = [&](uint32_t c) {
+    // surrogate gain: 1.0 per newly-served building + gamma * capped progress
+    double gainOf(uint32_t c) const {
         double g = 0;
-        uint64_t lo = vt.off[c], hi = vt.off[c + 1];
-        uint64_t i = lo;
+        uint64_t i = vt->off[c], hi = vt->off[c + 1];
         while (i < hi) {
-            uint32_t b = vt.data[i].bld;
+            uint32_t b = vt->data[i].bld;
             if (served[b]) {
-                while (i < hi && vt.data[i].bld == b) i++;
+                while (i < hi && vt->data[i].bld == b) i++;
                 continue;
             }
             double add = 0;
-            while (i < hi && vt.data[i].bld == b) {
-                add += cov[b].addedLen(vt.data[i].t0, vt.data[i].t1);
+            while (i < hi && vt->data[i].bld == b) {
+                add += cov[b].addedLen(vt->data[i].t0, vt->data[i].t1);
                 i++;
             }
             if (add <= 0) continue;
@@ -235,9 +251,122 @@ static void runGreedy(const Dataset& ds, const std::vector<Candidate>& cands,
             if (c0 < need[b] && c0 + add >= need[b]) g += 1.0;
         }
         return g;
-    };
+    }
 
-    // initial gains in parallel
+    void add(uint32_t c) {
+        isSel[c] = 1;
+        selected.push_back(c);
+        for (uint64_t i = vt->off[c]; i < vt->off[c + 1]; i++) {
+            uint32_t b = vt->data[i].bld;
+            if (touch[b].empty() || touch[b].back() != c) touch[b].push_back(c);
+            cov[b].insert(vt->data[i].t0, vt->data[i].t1);
+            if (!served[b] && cov[b].len >= need[b]) {
+                served[b] = 1;
+                score++;
+            }
+        }
+    }
+
+    // intervals of candidate c on building b (vt columns are sorted by bld)
+    std::pair<uint64_t, uint64_t> colOn(uint32_t c, uint32_t b) const {
+        uint64_t lo = vt->off[c], hi = vt->off[c + 1];
+        const IvRec* base = vt->data.data();
+        const IvRec* s = std::lower_bound(base + lo, base + hi, b,
+            [](const IvRec& r, uint32_t bb) { return r.bld < bb; });
+        const IvRec* e = s;
+        while (e < base + hi && e->bld == b) e++;
+        return {(uint64_t)(s - base), (uint64_t)(e - base)};
+    }
+
+    void remove(uint32_t c) {
+        isSel[c] = 0;
+        selected.erase(std::find(selected.begin(), selected.end(), c));
+        uint64_t i = vt->off[c], hi = vt->off[c + 1];
+        while (i < hi) {
+            uint32_t b = vt->data[i].bld;
+            while (i < hi && vt->data[i].bld == b) i++;
+            auto& tb = touch[b];
+            tb.erase(std::find(tb.begin(), tb.end(), c));
+            // rebuild b's union from remaining antennas
+            cov[b].ivs.clear();
+            cov[b].len = 0;
+            for (uint32_t a : tb) {
+                auto [s, e] = colOn(a, b);
+                for (uint64_t j = s; j < e; j++)
+                    cov[b].insert(vt->data[j].t0, vt->data[j].t1);
+            }
+            bool sv = cov[b].len >= need[b];
+            if (served[b] && !sv) { served[b] = 0; score--; }
+            else if (!served[b] && sv) { served[b] = 1; score++; }
+        }
+    }
+
+    // exact drop in served count if c were removed
+    int removalLoss(uint32_t c) const {
+        int loss = 0;
+        uint64_t i = vt->off[c], hi = vt->off[c + 1];
+        while (i < hi) {
+            uint32_t b = vt->data[i].bld;
+            while (i < hi && vt->data[i].bld == b) i++;
+            if (!served[b]) continue;
+            IvUnion u;
+            for (uint32_t a : touch[b]) {
+                if (a == c) continue;
+                auto [s, e] = colOn(a, b);
+                for (uint64_t j = s; j < e; j++)
+                    u.insert(vt->data[j].t0, vt->data[j].t1);
+                if (u.len >= need[b]) break;
+            }
+            if (u.len < need[b]) loss++;
+        }
+        return loss;
+    }
+
+    std::vector<uint32_t> servedIdx() const {
+        std::vector<uint32_t> sv;
+        for (size_t b = 0; b < served.size(); b++)
+            if (served[b]) sv.push_back((uint32_t)b);
+        return sv;
+    }
+};
+
+// Parallel argmax of state.gainOf over all non-selected candidates.
+static uint32_t bestCandidate(const OptState& st, int nthreads,
+                              const std::vector<uint8_t>* exclude = nullptr) {
+    size_t nc = st.vt->off.size() - 1;
+    std::vector<std::pair<double, uint32_t>> best(nthreads, {-1.0, UINT32_MAX});
+    std::atomic<size_t> next{0};
+    auto w = [&](int tid) {
+        std::pair<double, uint32_t> loc{-1.0, UINT32_MAX};
+        for (;;) {
+            size_t i = next.fetch_add(1024);
+            if (i >= nc) break;
+            size_t hi = std::min(i + 1024, nc);
+            for (; i < hi; i++) {
+                if (st.isSel[i] || (exclude && (*exclude)[i])) continue;
+                double g = st.gainOf((uint32_t)i);
+                if (g > loc.first) loc = {g, (uint32_t)i};
+            }
+        }
+        best[tid] = loc;
+    };
+    std::vector<std::thread> ths;
+    for (int t = 0; t < nthreads; t++) ths.emplace_back(w, t);
+    for (auto& t : ths) t.join();
+    std::pair<double, uint32_t> r{-1.0, UINT32_MAX};
+    for (auto& b : best)
+        if (b.first > r.first) r = b;
+    return r.second;
+}
+
+struct GreedyResult {
+    std::vector<uint32_t> picks;
+    std::vector<std::pair<int, int>> scores;  // (k, served) at snapshots
+};
+
+static void runGreedy(OptState& st, const std::vector<int>& ks, int nthreads,
+                      GreedyResult& res) {
+    size_t nc = st.vt->off.size() - 1;
     std::vector<double> gain0(nc);
     {
         std::atomic<size_t> nextIdx{0};
@@ -246,7 +375,7 @@ static void runGreedy(const Dataset& ds, const std::vector<Candidate>& cands,
                 size_t i = nextIdx.fetch_add(256);
                 if (i >= nc) break;
                 size_t hi2 = std::min(i + 256, nc);
-                for (; i < hi2; i++) gain0[i] = gainOf((uint32_t)i);
+                for (; i < hi2; i++) gain0[i] = st.gainOf((uint32_t)i);
             }
         };
         std::vector<std::thread> ths;
@@ -261,46 +390,129 @@ static void runGreedy(const Dataset& ds, const std::vector<Candidate>& cands,
         bool operator<(const HeapEnt& o) const { return g < o.g; }
     };
     std::priority_queue<HeapEnt> heap;
-    std::vector<uint8_t> chosen(nc, 0);
-    for (size_t i = 0; i < nc; i++)
-        heap.push({gain0[i], (uint32_t)i, 0});
+    for (size_t i = 0; i < nc; i++) heap.push({gain0[i], (uint32_t)i, 0});
 
     int kmax = 0;
     for (int k : ks) kmax = std::max(kmax, k);
-    uint32_t round = 0;
     std::vector<int> ksSorted(ks);
     std::sort(ksSorted.begin(), ksSorted.end());
     size_t ksNext = 0;
+    uint32_t round = 0;
 
     while ((int)res.picks.size() < kmax && !heap.empty()) {
         HeapEnt e = heap.top();
         heap.pop();
-        if (chosen[e.c]) continue;
+        if (st.isSel[e.c]) continue;
         if (e.round != round) {
-            e.g = gainOf(e.c);
+            e.g = st.gainOf(e.c);
             e.round = round;
             heap.push(e);
             continue;
         }
-        // commit
-        chosen[e.c] = 1;
-        uint64_t lo = vt.off[e.c], hi = vt.off[e.c + 1];
-        for (uint64_t i = lo; i < hi; i++) {
-            uint32_t b = vt.data[i].bld;
-            cov[b].insert(vt.data[i].t0, vt.data[i].t1);
-            if (!served[b] && cov[b].len >= need[b]) served[b] = 1;
-        }
+        st.add(e.c);
         res.picks.push_back(e.c);
         round++;
         while (ksNext < ksSorted.size() &&
                (int)res.picks.size() == ksSorted[ksNext]) {
-            std::vector<uint32_t> sv;
-            for (size_t b = 0; b < nb; b++)
-                if (served[b]) sv.push_back((uint32_t)b);
-            res.snapshots.push_back({ksSorted[ksNext], std::move(sv)});
+            res.scores.push_back({ksSorted[ksNext], st.score});
             ksNext++;
         }
     }
+}
+
+// Swap-based local search: repeatedly evict the antenna with the smallest
+// exact removal loss and re-add the globally best replacement.
+static void localSearch(OptState& st, double seconds, int nthreads,
+                        uint64_t seed) {
+    auto tstart = Clock::now();
+    uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ull;
+    auto rnd = [&]() {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        return rng;
+    };
+    std::vector<uint8_t> excl(st.isSel.size(), 0);
+    int sinceImprove = 0;
+    int iters = 0;
+    while (secs(tstart, Clock::now()) < seconds && sinceImprove < 5000) {
+        iters++;
+        // victim = random antenna among those with minimal removal loss;
+        // occasionally a fully random one to escape plateaus
+        int minLoss = INT32_MAX;
+        std::vector<uint32_t> cands;
+        if (rnd() % 100 < 15) {
+            cands.push_back(st.selected[rnd() % st.selected.size()]);
+            minLoss = 0;
+        } else {
+            std::vector<int> loss(st.selected.size());
+            std::atomic<size_t> next{0};
+            auto w = [&]() {
+                for (;;) {
+                    size_t i = next.fetch_add(8);
+                    if (i >= st.selected.size()) break;
+                    size_t hi = std::min(i + 8, st.selected.size());
+                    for (; i < hi; i++) loss[i] = st.removalLoss(st.selected[i]);
+                }
+            };
+            std::vector<std::thread> ths;
+            for (int t = 0; t < nthreads; t++) ths.emplace_back(w);
+            for (auto& t : ths) t.join();
+            for (size_t i = 0; i < st.selected.size(); i++)
+                minLoss = std::min(minLoss, loss[i]);
+            for (size_t i = 0; i < st.selected.size(); i++)
+                if (loss[i] == minLoss) cands.push_back(st.selected[i]);
+        }
+        uint32_t victim = cands[rnd() % cands.size()];
+        int before = st.score;
+        st.remove(victim);
+        excl[victim] = 1;
+        uint32_t repl = bestCandidate(st, nthreads, &excl);
+        excl[victim] = 0;
+        if (repl == UINT32_MAX) { st.add(victim); break; }
+        st.add(repl);
+        if (st.score < before) {  // revert
+            st.remove(repl);
+            st.add(victim);
+            sinceImprove++;
+        } else if (st.score == before) {
+            sinceImprove++;
+        } else {
+            sinceImprove = 0;
+        }
+    }
+    std::fprintf(stderr, "  localsearch: %d iters, %.1fs\n", iters,
+                 secs(tstart, Clock::now()));
+}
+
+// ---------------------------------------------------------------- vis cache
+// Cache format: [ncand u64][off (ncand+1) u64][ndata u64][IvRec...][cand p/q/bld]
+static bool saveVis(const std::string& path, const VisTable& vt,
+                    const std::vector<Candidate>& cands) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    uint64_t nc = cands.size(), nd = vt.data.size();
+    std::fwrite(&nc, 8, 1, f);
+    std::fwrite(vt.off.data(), 8, vt.off.size(), f);
+    std::fwrite(&nd, 8, 1, f);
+    std::fwrite(vt.data.data(), sizeof(IvRec), nd, f);
+    std::fwrite(cands.data(), sizeof(Candidate), nc, f);
+    std::fclose(f);
+    return true;
+}
+static bool loadVis(const std::string& path, VisTable& vt,
+                    std::vector<Candidate>& cands) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    uint64_t nc = 0, nd = 0;
+    if (std::fread(&nc, 8, 1, f) != 1) { std::fclose(f); return false; }
+    vt.off.resize(nc + 1);
+    if (std::fread(vt.off.data(), 8, nc + 1, f) != nc + 1) { std::fclose(f); return false; }
+    if (std::fread(&nd, 8, 1, f) != 1) { std::fclose(f); return false; }
+    vt.data.resize(nd);
+    if (std::fread(vt.data.data(), sizeof(IvRec), nd, f) != nd) { std::fclose(f); return false; }
+    cands.resize(nc);
+    if (std::fread(cands.data(), sizeof(Candidate), nc, f) != nc) { std::fclose(f); return false; }
+    std::fclose(f);
+    return true;
 }
 
 // ---------------------------------------------------------------- main
@@ -322,10 +534,12 @@ int main(int argc, char** argv) {
                      "       solver buildings.txt --testvis qx qy R\n");
         return 1;
     }
-    double R = 400, spacing = 12, eps = 1e-6, gamma = 0.4, minIvLen = 0.02;
+    double R = 400, spacing = 12, eps = 1e-6, minIvLen = 0.02, lsTime = 0;
     std::vector<double> taus = {0.25, 0.5, 0.75};
+    std::vector<double> gammas = {0.05, 0.1, 0.2, 0.4, 0.7, 1.0, 1.5};
     std::vector<int> ks = {50, 500, 1000};
     std::string outDir = "results";
+    std::string visCache;
     int nthreads = (int)std::thread::hardware_concurrency();
     bool testvis = false;
     double tvx = 0, tvy = 0, tvR = 0;
@@ -334,10 +548,12 @@ int main(int argc, char** argv) {
         auto is = [&](const char* o) { return std::strcmp(argv[i], o) == 0; };
         if (is("--R")) R = std::atof(argv[++i]);
         else if (is("--spacing")) spacing = std::atof(argv[++i]);
-        else if (is("--gamma")) gamma = std::atof(argv[++i]);
+        else if (is("--gammas")) gammas = parseList(argv[++i]);
+        else if (is("--lstime")) lsTime = std::atof(argv[++i]);
         else if (is("--minivlen")) minIvLen = std::atof(argv[++i]);
         else if (is("--threads")) nthreads = std::atoi(argv[++i]);
         else if (is("--out")) outDir = argv[++i];
+        else if (is("--viscache")) visCache = argv[++i];
         else if (is("--taus")) taus = parseList(argv[++i]);
         else if (is("--ks")) {
             ks.clear();
@@ -367,42 +583,73 @@ int main(int argc, char** argv) {
     }
 
     auto t0 = Clock::now();
-    BuildingGrid bg;
-    bg.build(ds, 100.0);
     std::vector<Candidate> cands;
-    genCandidates(ds, bg, spacing, eps, cands);
-
     VisTable vt;
-    batchVisibility(ds, grid, cands, R, minIvLen, nthreads, vt);
-    auto t1 = Clock::now();
-    std::fprintf(stderr, "visibility: %.1fs, %zu candidates, %zu intervals (%.0f MB)\n",
-                 secs(t0, t1), cands.size(), vt.data.size(),
-                 vt.data.size() * sizeof(IvRec) / 1e6);
+    if (!visCache.empty() && loadVis(visCache, vt, cands)) {
+        std::fprintf(stderr, "loaded vis cache: %zu candidates, %zu intervals\n",
+                     cands.size(), vt.data.size());
+    } else {
+        BuildingGrid bg;
+        bg.build(ds, 100.0);
+        genCandidates(ds, bg, spacing, eps, cands);
+        batchVisibility(ds, grid, cands, R, minIvLen, nthreads, vt);
+        auto t1 = Clock::now();
+        std::fprintf(stderr,
+                     "visibility: %.1fs, %zu candidates, %zu intervals (%.0f MB)\n",
+                     secs(t0, t1), cands.size(), vt.data.size(),
+                     vt.data.size() * sizeof(IvRec) / 1e6);
+        if (!visCache.empty()) saveVis(visCache, vt, cands);
+    }
 
     for (double tau : taus) {
-        auto tg0 = Clock::now();
-        GreedyResult res;
-        runGreedy(ds, cands, vt, tau, ks, gamma, nthreads, res);
-        auto tg1 = Clock::now();
-        for (auto& [k, servedIdx] : res.snapshots) {
+        // greedy portfolio over gamma values; keep best picks per k
+        struct Best {
+            int score = -1;
+            double gamma = 0;
+            std::vector<uint32_t> picks;
+        };
+        std::map<int, Best> best;
+        for (double g : gammas) {
+            OptState st;
+            st.init(ds, vt, tau, g);
+            GreedyResult res;
+            runGreedy(st, ks, nthreads, res);
+            for (auto& [k, sc] : res.scores) {
+                if (sc > best[k].score) {
+                    best[k] = {sc, g,
+                               std::vector<uint32_t>(res.picks.begin(),
+                                                     res.picks.begin() + k)};
+                }
+            }
+        }
+        for (int k : ks) {
+            Best& b = best[k];
+            OptState st;
+            st.init(ds, vt, tau, 0.4);  // small progress term as LS tiebreak
+            for (uint32_t c : b.picks) st.add(c);
+            int g0 = st.score;
+            if (lsTime > 0) localSearch(st, lsTime, nthreads, 12345 + k);
+            std::fprintf(stderr,
+                         "tau=%.2f k=%d: greedy %d (gamma=%.2f) -> ls %d / %zu\n",
+                         tau, k, g0, b.gamma, st.score, ds.blds.size());
+
             char path[512];
             std::snprintf(path, sizeof path, "%s/sol_t%g_k%d.txt", outDir.c_str(),
                           tau, k);
             FILE* f = std::fopen(path, "w");
             if (!f) { std::fprintf(stderr, "cannot write %s\n", path); return 1; }
             std::fprintf(f, "%g %d\n", tau, k);
-            for (int i = 0; i < k; i++) {
-                const Candidate& c = cands[res.picks[i]];
+            for (size_t i = 0; i < st.selected.size(); i++) {
+                const Candidate& c = cands[st.selected[i]];
                 std::fprintf(f, "%s%.17g %.17g", i ? ";" : "", c.p.x, c.p.y);
             }
             std::fprintf(f, "\n");
-            for (size_t i = 0; i < servedIdx.size(); i++)
+            auto sv = st.servedIdx();
+            for (size_t i = 0; i < sv.size(); i++)
                 std::fprintf(f, "%s%lld", i ? "," : "",
-                             (long long)ds.blds[servedIdx[i]].id);
+                             (long long)ds.blds[sv[i]].id);
             std::fprintf(f, "\n");
             std::fclose(f);
-            std::fprintf(stderr, "tau=%.2f k=%d: served %zu / %zu  (%.1fs)\n", tau,
-                         k, servedIdx.size(), ds.blds.size(), secs(tg0, tg1));
         }
     }
     return 0;
