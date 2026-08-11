@@ -624,6 +624,7 @@ int main(int argc, char** argv) {
     std::string visCache;
     int nthreads = (int)std::thread::hardware_concurrency();
     bool testvis = false, witness = false;
+    int probeN = 0;
     double tvx = 0, tvy = 0, tvR = 0;
 
     for (int i = 2; i < argc; i++) {
@@ -639,6 +640,7 @@ int main(int argc, char** argv) {
         else if (is("--out")) outDir = argv[++i];
         else if (is("--viscache")) visCache = argv[++i];
         else if (is("--witness")) witness = true;
+        else if (is("--probe")) probeN = std::atoi(argv[++i]);
         else if (is("--taus")) taus = parseList(argv[++i]);
         else if (is("--ks")) {
             ks.clear();
@@ -657,6 +659,38 @@ int main(int argc, char** argv) {
                  ds.edges.size());
     EdgeGrid grid;
     grid.build(ds, 40.0);
+
+    if (probeN > 0) {
+        // Time a random sample of candidates so the operator can pick R and
+        // spacing that fit the 24-hour window on an unseen dataset.
+        BuildingGrid bg;
+        bg.build(ds, 100.0);
+        std::vector<Candidate> cands;
+        genCandidates(ds, bg, spacing, eps, cands);
+        size_t n = std::min((size_t)probeN, cands.size());
+        std::vector<Candidate> sample;
+        uint64_t rs = 12345;
+        for (size_t i = 0; i < n; i++) {
+            rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+            sample.push_back(cands[rs % cands.size()]);
+        }
+        VisTable svt;
+        auto p0 = Clock::now();
+        batchVisibility(ds, grid, sample, R, minIvLen, nthreads, svt);
+        double el = secs(p0, Clock::now());
+        double perCand = el / (double)n;
+        double ivPerCand = (double)svt.data.size() / (double)n;
+        std::printf("probe R=%g spacing=%g threads=%d\n", R, spacing, nthreads);
+        std::printf("  candidates total : %zu\n", cands.size());
+        std::printf("  sampled          : %zu in %.2fs (%.3f ms/candidate)\n",
+                    n, el, perCand * 1000);
+        std::printf("  est. visibility  : %.0fs (%.1f min)\n",
+                    perCand * cands.size(), perCand * cands.size() / 60);
+        std::printf("  est. intervals   : %.0f (%.0f MB)\n",
+                    ivPerCand * cands.size(),
+                    ivPerCand * cands.size() * sizeof(IvRec) / 1e6);
+        return 0;
+    }
 
     if (testvis) {
         SweepScratch sc;

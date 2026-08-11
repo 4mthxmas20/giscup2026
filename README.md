@@ -57,8 +57,23 @@ python3 python/make_submission.py results results/submission.zip
 python3 python/visualize.py in.geojson results/sol_t0.5_k500.txt out.png
 ```
 
-Useful solver flags: `--viscache f.bin` (reuse visibility across runs),
-`--taus`, `--ks`, `--gammas`, `--threads`, `--minivlen`.
+Useful solver flags: `--probe N` (time a candidate sample and extrapolate the
+visibility pass before committing to R/spacing), `--viscache f.bin` (reuse
+visibility across runs — never across datasets), `--lstime` / `--lnstime`
+(per-config search budgets), `--maxruin`, `--taus`, `--ks`, `--gammas`,
+`--threads`, `--minivlen`.
+
+## Checking against the official evaluator
+
+`.github/workflows/official-eval.yml` runs the organizers' own evaluator
+(ArcGIS geometry, 1 mm spatial tolerance) on GitHub runners, one job per
+sub-problem, and fails if any claimed building is rejected:
+
+```bash
+gh workflow run official-eval.yml
+```
+
+See [RUNBOOK.md](RUNBOOK.md) for the competition-day procedure.
 
 ## Layout
 
