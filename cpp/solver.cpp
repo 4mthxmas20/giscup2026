@@ -455,6 +455,7 @@ static void lnsSearch(OptState& st, double seconds, int nthreads, uint64_t seed,
     int iters = 0, improves = 0, undos = 0;
 
     while (secs(tstart, Clock::now()) < seconds) {
+        if (st.score == (int)st.served.size()) break;  // every building served
         iters++;
         int scoreBefore = st.score;
         int m = 1 + (int)(rnd() % (uint64_t)std::max(1, maxRuin));
@@ -533,6 +534,7 @@ static void localSearch(OptState& st, double seconds, int nthreads,
     int sinceImprove = 0;
     int iters = 0;
     while (secs(tstart, Clock::now()) < seconds && sinceImprove < 5000) {
+        if (st.score == (int)st.served.size()) break;  // every building served
         iters++;
         // victim = random antenna among those with minimal removal loss;
         // occasionally a fully random one to escape plateaus
