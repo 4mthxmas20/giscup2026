@@ -2,9 +2,14 @@
 """Convert a GISCUP GeoJSON building-footprint file into the plain-text
 format consumed by the C++ solver, and print dataset statistics.
 
+Building IDs are treated as opaque strings (the official evaluator accepts
+strings or numbers and canonicalizes with String(id).trim()). The solver only
+ever sees a 0-based index; `<out>.ids.json` maps index -> original ID so that
+verification and packaging can emit the dataset's own IDs.
+
 Output format (text, full double precision):
     n_buildings
-    id n_vertices
+    index n_vertices
     x y            (n_vertices lines, exterior ring, closing vertex dropped)
     ...
 """
@@ -53,6 +58,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("geojson")
     ap.add_argument("out")
+    ap.add_argument("--ids", help="index -> original ID map (default: <out>.ids.json)")
     args = ap.parse_args()
 
     with open(args.geojson) as f:
@@ -64,7 +70,8 @@ def main():
     n_multi = 0
     for feat in feats:
         geom = feat["geometry"]
-        bid = feat["properties"]["id"]
+        # match the evaluator's canonicalization: String(id).trim()
+        bid = str(feat["properties"]["id"]).strip()
         if geom["type"] == "Polygon":
             rings = [geom["coordinates"]]
         elif geom["type"] == "MultiPolygon":
@@ -92,10 +99,15 @@ def main():
 
     with open(args.out, "w") as f:
         f.write(f"{len(buildings)}\n")
-        for bid, ring in buildings:
-            f.write(f"{bid} {len(ring)}\n")
+        for index, (_bid, ring) in enumerate(buildings):
+            f.write(f"{index} {len(ring)}\n")
             for x, y in ring:
                 f.write(f"{x!r} {y!r}\n")
+
+    ids_path = args.ids or args.out + ".ids.json"
+    with open(ids_path, "w") as f:
+        json.dump([bid for bid, _ring in buildings], f)
+    print(f"wrote {args.out} and {ids_path}")
 
     # stats
     nv = [len(r) for _, r in buildings]

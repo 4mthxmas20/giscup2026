@@ -31,7 +31,7 @@ def load_buildings(path):
         geom = feat["geometry"]
         if geom["type"] != "Polygon":
             continue
-        bid = feat["properties"]["id"]
+        bid = str(feat["properties"]["id"]).strip()
         blds[bid] = Polygon(geom["coordinates"][0])
     return blds
 
@@ -92,7 +92,9 @@ def union_len(ivs, per):
     return total
 
 
-def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng):
+def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng, ids):
+    """Solver files identify buildings by 0-based index; `ids` maps those back
+    to the dataset's own IDs."""
     sol = os.path.join(soldir, f"sol_{tag}.txt")
     wit = os.path.join(soldir, f"wit_{tag}.txt")
     with open(sol) as f:
@@ -101,6 +103,7 @@ def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng):
         coords = [tuple(map(float, c.split())) for c in f.readline().split(";")]
         claimed = [int(x) for x in f.readline().split(",")]
     assert len(coords) == k, f"{tag}: {len(coords)} coords != k={k}"
+    assert len(set(coords)) == k, f"{tag}: duplicate antenna coordinates"
 
     # 1. antennas on boundaries
     bad_pos = 0
@@ -127,7 +130,7 @@ def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng):
     n_checked_pts = 0
     valid = []
     for bid in claimed:
-        poly = gj_blds[bid]
+        poly = gj_blds[ids[bid]]
         ring = list(poly.exterior.coords)[:-1]
         # match the solver's CCW normalization so arc params line up
         area = sum(ring[j][0] * ring[(j + 1) % len(ring)][1] -
@@ -176,7 +179,14 @@ def main():
                     help="visibility samples per claimed building")
     ap.add_argument("--configs", nargs="*", default=None)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--ids", default=None,
+                    help="index -> ID map from prepare.py "
+                         "(default: <soldir>/buildings.txt.ids.json)")
     args = ap.parse_args()
+
+    ids_path = args.ids or os.path.join(args.soldir, "buildings.txt.ids.json")
+    with open(ids_path) as f:
+        ids = json.load(f)
 
     gj_blds = load_buildings(args.geojson)
     poly_ids = sorted(gj_blds)
@@ -193,7 +203,7 @@ def main():
     all_ok = True
     for tag in tags:
         all_ok &= verify_config(gj_blds, tree, polys, shrunk, args.soldir,
-                                tag, args.samples, rng)
+                                tag, args.samples, rng, ids)
     sys.exit(0 if all_ok else 1)
 
 

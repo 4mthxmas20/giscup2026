@@ -331,6 +331,18 @@ struct OptState {
             if (served[b]) sv.push_back((uint32_t)b);
         return sv;
     }
+
+    // Rebuild the whole state from an antenna set. Cheaper than it looks:
+    // dominated by the adds, which cost the same as one greedy step each.
+    void setSelection(const std::vector<uint32_t>& sel) {
+        std::fill(cov.begin(), cov.end(), IvUnion{});
+        std::fill(served.begin(), served.end(), (uint8_t)0);
+        for (auto& t : touch) t.clear();
+        std::fill(isSel.begin(), isSel.end(), (uint8_t)0);
+        selected.clear();
+        score = 0;
+        for (uint32_t c : sel) add(c);
+    }
 };
 
 // Parallel argmax of state.gainOf over all non-selected candidates.
@@ -421,6 +433,71 @@ static void runGreedy(OptState& st, const std::vector<int>& ks, int nthreads,
             ksNext++;
         }
     }
+}
+
+// Large-neighborhood search: ruin a handful of antennas and rebuild greedily.
+// A 1-opt swap can only cross a barrier one antenna at a time, which stalls at
+// high tau where a building needs several antennas together; removing m at once
+// lets the rebuild discover those combinations.
+static void lnsSearch(OptState& st, double seconds, int nthreads, uint64_t seed,
+                      int maxRuin) {
+    auto tstart = Clock::now();
+    uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ull;
+    auto rnd = [&]() {
+        rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
+        return rng;
+    };
+    std::vector<uint32_t> best = st.selected;
+    int bestScore = st.score;
+    std::vector<uint8_t> excl(st.isSel.size(), 0);
+    std::vector<uint32_t> victims, added;
+    int iters = 0, improves = 0, undos = 0;
+
+    while (secs(tstart, Clock::now()) < seconds) {
+        iters++;
+        int scoreBefore = st.score;
+        int m = 1 + (int)(rnd() % (uint64_t)std::max(1, maxRuin));
+        m = std::min(m, (int)st.selected.size());
+
+        victims.clear();
+        added.clear();
+        for (int i = 0; i < m && !st.selected.empty(); i++) {
+            uint32_t v = st.selected[rnd() % st.selected.size()];
+            if (std::find(victims.begin(), victims.end(), v) != victims.end()) continue;
+            victims.push_back(v);
+            st.remove(v);
+        }
+        if (victims.empty()) break;
+
+        // Forbid the victims on the first rebuild pick so each iteration
+        // genuinely moves; afterwards they may come back if they are best.
+        for (uint32_t v : victims) excl[v] = 1;
+        for (size_t i = 0; i < victims.size(); i++) {
+            uint32_t c = bestCandidate(st, nthreads, &excl);
+            if (i == 0) {
+                for (uint32_t v : victims) excl[v] = 0;
+            }
+            if (c == UINT32_MAX) break;
+            st.add(c);
+            added.push_back(c);
+        }
+        for (uint32_t v : victims) excl[v] = 0;
+
+        if (st.score < scoreBefore) {
+            // Undo incrementally: m removes + m adds, not a full k-add rebuild.
+            for (uint32_t c : added) st.remove(c);
+            for (uint32_t v : victims) st.add(v);
+            undos++;
+        } else if (st.score > bestScore) {
+            bestScore = st.score;
+            best = st.selected;
+            improves++;
+        }
+        // equal score: keep the new configuration and keep walking the plateau
+    }
+    if (st.score < bestScore) st.setSelection(best);
+    std::fprintf(stderr, "  lns: %d iters (%d improves, %d undos), %.1fs\n",
+                 iters, improves, undos, secs(tstart, Clock::now()));
 }
 
 // Swap-based local search: repeatedly evict the antenna with the smallest
@@ -538,6 +615,8 @@ int main(int argc, char** argv) {
         return 1;
     }
     double R = 400, spacing = 12, eps = 1e-6, minIvLen = 0.02, lsTime = 0;
+    double lnsTime = 0;
+    int maxRuin = 6;
     std::vector<double> taus = {0.25, 0.5, 0.75};
     std::vector<double> gammas = {0.05, 0.1, 0.2, 0.4, 0.7, 1.0, 1.5};
     std::vector<int> ks = {50, 500, 1000};
@@ -553,6 +632,8 @@ int main(int argc, char** argv) {
         else if (is("--spacing")) spacing = std::atof(argv[++i]);
         else if (is("--gammas")) gammas = parseList(argv[++i]);
         else if (is("--lstime")) lsTime = std::atof(argv[++i]);
+        else if (is("--lnstime")) lnsTime = std::atof(argv[++i]);
+        else if (is("--maxruin")) maxRuin = std::atoi(argv[++i]);
         else if (is("--minivlen")) minIvLen = std::atof(argv[++i]);
         else if (is("--threads")) nthreads = std::atoi(argv[++i]);
         else if (is("--out")) outDir = argv[++i];
@@ -633,9 +714,11 @@ int main(int argc, char** argv) {
             for (uint32_t c : b.picks) st.add(c);
             int g0 = st.score;
             if (lsTime > 0) localSearch(st, lsTime, nthreads, 12345 + k);
+            int g1 = st.score;
+            if (lnsTime > 0) lnsSearch(st, lnsTime, nthreads, 999 + k, maxRuin);
             std::fprintf(stderr,
-                         "tau=%.2f k=%d: greedy %d (gamma=%.2f) -> ls %d / %zu\n",
-                         tau, k, g0, b.gamma, st.score, ds.blds.size());
+                         "tau=%.2f k=%d: greedy %d (gamma=%.2f) -> ls %d -> lns %d / %zu\n",
+                         tau, k, g0, b.gamma, g1, st.score, ds.blds.size());
 
             char path[512];
             std::snprintf(path, sizeof path, "%s/sol_t%g_k%d.txt", outDir.c_str(),
