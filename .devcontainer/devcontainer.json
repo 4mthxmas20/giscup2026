@@ -2,8 +2,9 @@
   "name": "giscup2026",
   "image": "mcr.microsoft.com/devcontainers/javascript-node:24",
   "features": {
+    "ghcr.io/devcontainers/features/sshd:1": { "version": "latest" },
     "ghcr.io/devcontainers/features/python:1": { "version": "3.12" }
   },
-  "hostRequirements": { "cpus": 4, "memory": "16gb", "storage": "32gb" },
-  "postCreateCommand": "npm install -g pnpm@11.16.0 && pip install --user shapely numpy"
+  "hostRequirements": { "cpus": 8, "memory": "32gb", "storage": "32gb" },
+  "postCreateCommand": "npm install -g pnpm@11.16.0"
 }
