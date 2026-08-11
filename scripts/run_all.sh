@@ -5,6 +5,8 @@
 #
 # The competition ships its own parameter file, so tau/k are overridable:
 #   TAUS=0.3,0.6 KS=100,1000 scripts/run_all.sh comp.geojson 600
+# Visibility is cached by default and validated against the prepared dataset
+# plus R/spacing; set VISCACHE= to disable.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -18,6 +20,7 @@ R="${3:-1200}"
 SPACING="${4:-6}"
 TAUS="${TAUS:-0.25,0.5,0.75}"
 KS="${KS:-50,500,1000}"
+VISCACHE="${VISCACHE-cache/vis_r${R}_s${SPACING}.bin}"
 PY=.venv/bin/python
 [ -x "$PY" ] || PY=python3
 
@@ -30,9 +33,13 @@ $PY python/prepare.py "$GEOJSON" results/buildings.txt
 
 echo "== solve (R=$R spacing=$SPACING ls=${LSTIME}s lns=${LNSTIME}s, taus=$TAUS ks=$KS) =="
 rm -f results/sol_t*_k*.txt results/wit_t*_k*.txt
-cpp/solver results/buildings.txt --R "$R" --spacing "$SPACING" \
-    --lstime "$LSTIME" --lnstime "$LNSTIME" --witness \
-    --taus "$TAUS" --ks "$KS" --out results
+SOLVER_ARGS=(results/buildings.txt --R "$R" --spacing "$SPACING"
+    --lstime "$LSTIME" --lnstime "$LNSTIME" --witness
+    --taus "$TAUS" --ks "$KS" --out results)
+if [ -n "$VISCACHE" ]; then
+    SOLVER_ARGS+=(--viscache "$VISCACHE")
+fi
+cpp/solver "${SOLVER_ARGS[@]}"
 
 echo "== verify =="
 $PY python/verify.py "$GEOJSON" results --samples 20

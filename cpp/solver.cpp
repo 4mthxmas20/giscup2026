@@ -627,12 +627,51 @@ static bool loadWarmStart(const std::string& path,
 }
 
 // ---------------------------------------------------------------- vis cache
-// Cache format: [ncand u64][off (ncand+1) u64][ndata u64][IvRec...][cand p/q/bld]
+static uint64_t hashBytes(uint64_t h, const void* data, size_t n) {
+    const unsigned char* p = (const unsigned char*)data;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+static uint64_t hashU64(uint64_t h, uint64_t v) {
+    return hashBytes(h, &v, sizeof v);
+}
+static uint64_t hashDouble(uint64_t h, double v) {
+    return hashBytes(h, &v, sizeof v);
+}
+static uint64_t datasetFingerprint(const Dataset& ds) {
+    uint64_t h = 1469598103934665603ull;
+    h = hashU64(h, (uint64_t)ds.blds.size());
+    for (const Building& b : ds.blds) {
+        h = hashU64(h, (uint64_t)b.id);
+        h = hashU64(h, (uint64_t)b.pts.size());
+        for (Pt p : b.pts) {
+            h = hashDouble(h, p.x);
+            h = hashDouble(h, p.y);
+        }
+    }
+    return h;
+}
+
+// Cache format v2:
+// [magic 8][dataset fingerprint u64][R double][spacing double][eps double]
+// [minIvLen double][ncand u64][off (ncand+1) u64][ndata u64][IvRec...]
+// [cand p/q/bld]. Mismatched caches are ignored and rebuilt.
 static bool saveVis(const std::string& path, const VisTable& vt,
-                    const std::vector<Candidate>& cands) {
+                    const std::vector<Candidate>& cands, uint64_t fingerprint,
+                    double R, double spacing, double eps, double minIvLen) {
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) return false;
+    const char magic[8] = {'G', 'I', 'S', 'V', 'I', 'S', '2', '\0'};
     uint64_t nc = cands.size(), nd = vt.data.size();
+    std::fwrite(magic, 1, sizeof magic, f);
+    std::fwrite(&fingerprint, 8, 1, f);
+    std::fwrite(&R, sizeof R, 1, f);
+    std::fwrite(&spacing, sizeof spacing, 1, f);
+    std::fwrite(&eps, sizeof eps, 1, f);
+    std::fwrite(&minIvLen, sizeof minIvLen, 1, f);
     std::fwrite(&nc, 8, 1, f);
     std::fwrite(vt.off.data(), 8, vt.off.size(), f);
     std::fwrite(&nd, 8, 1, f);
@@ -642,9 +681,38 @@ static bool saveVis(const std::string& path, const VisTable& vt,
     return true;
 }
 static bool loadVis(const std::string& path, VisTable& vt,
-                    std::vector<Candidate>& cands) {
+                    std::vector<Candidate>& cands, uint64_t fingerprint,
+                    double R, double spacing, double eps, double minIvLen) {
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return false;
+    char magic[8];
+    const char want[8] = {'G', 'I', 'S', 'V', 'I', 'S', '2', '\0'};
+    if (std::fread(magic, 1, sizeof magic, f) != sizeof magic ||
+        std::memcmp(magic, want, sizeof magic) != 0) {
+        std::fprintf(stderr, "ignoring legacy or invalid vis cache: %s\n",
+                     path.c_str());
+        std::fclose(f);
+        return false;
+    }
+    uint64_t gotFingerprint = 0;
+    double gotR = 0, gotSpacing = 0, gotEps = 0, gotMinIvLen = 0;
+    if (std::fread(&gotFingerprint, 8, 1, f) != 1 ||
+        std::fread(&gotR, sizeof gotR, 1, f) != 1 ||
+        std::fread(&gotSpacing, sizeof gotSpacing, 1, f) != 1 ||
+        std::fread(&gotEps, sizeof gotEps, 1, f) != 1 ||
+        std::fread(&gotMinIvLen, sizeof gotMinIvLen, 1, f) != 1) {
+        std::fclose(f);
+        return false;
+    }
+    if (gotFingerprint != fingerprint || gotR != R || gotSpacing != spacing ||
+        gotEps != eps || gotMinIvLen != minIvLen) {
+        std::fprintf(stderr,
+                     "ignoring mismatched vis cache: %s "
+                     "(dataset/R/spacing/eps/minivlen changed)\n",
+                     path.c_str());
+        std::fclose(f);
+        return false;
+    }
     uint64_t nc = 0, nd = 0;
     if (std::fread(&nc, 8, 1, f) != 1) { std::fclose(f); return false; }
     vt.off.resize(nc + 1);
@@ -724,6 +792,7 @@ int main(int argc, char** argv) {
     ds.load(argv[1]);
     std::fprintf(stderr, "loaded %zu buildings, %zu edges\n", ds.blds.size(),
                  ds.edges.size());
+    uint64_t visFingerprint = datasetFingerprint(ds);
     EdgeGrid grid;
     grid.build(ds, 40.0);
 
@@ -771,7 +840,8 @@ int main(int argc, char** argv) {
     auto t0 = Clock::now();
     std::vector<Candidate> cands;
     VisTable vt;
-    if (!visCache.empty() && loadVis(visCache, vt, cands)) {
+    if (!visCache.empty() &&
+        loadVis(visCache, vt, cands, visFingerprint, R, spacing, eps, minIvLen)) {
         std::fprintf(stderr, "loaded vis cache: %zu candidates, %zu intervals\n",
                      cands.size(), vt.data.size());
     } else {
@@ -784,7 +854,9 @@ int main(int argc, char** argv) {
                      "visibility: %.1fs, %zu candidates, %zu intervals (%.0f MB)\n",
                      secs(t0, t1), cands.size(), vt.data.size(),
                      vt.data.size() * sizeof(IvRec) / 1e6);
-        if (!visCache.empty()) saveVis(visCache, vt, cands);
+        if (!visCache.empty())
+            saveVis(visCache, vt, cands, visFingerprint, R, spacing, eps,
+                    minIvLen);
     }
 
     for (double tau : taus) {

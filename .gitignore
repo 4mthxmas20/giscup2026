@@ -9,3 +9,4 @@ cache/
 results/*.viz.png
 results/wit_*.txt
 results/*.bin
+cpp/solver

@@ -59,9 +59,9 @@ python3 python/visualize.py in.geojson results/sol_t0.5_k500.txt out.png
 
 Useful solver flags: `--probe N` (time a candidate sample and extrapolate the
 visibility pass before committing to R/spacing), `--viscache f.bin` (reuse
-visibility across runs — never across datasets), `--lstime` / `--lnstime`
-(per-config search budgets), `--maxruin`, `--taus`, `--ks`, `--gammas`,
-`--threads`, `--minivlen`.
+visibility across runs; the cache is validated against the prepared dataset
+and geometry parameters), `--lstime` / `--lnstime` (per-config search budgets),
+`--maxruin`, `--taus`, `--ks`, `--gammas`, `--threads`, `--minivlen`.
 
 ## Checking against the official evaluator
 

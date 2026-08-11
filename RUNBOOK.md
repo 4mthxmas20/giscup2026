@@ -107,7 +107,9 @@ cpp/solver results/buildings.txt --R <R> --spacing <spacing> \
 ```
 
 `--viscache` writes the visibility table once so later re-runs with more search
-time skip the expensive pass. **Never reuse a cache across datasets.**
+time skip the expensive pass. The solver now validates the cache against the
+prepared dataset plus R/spacing/epsilon/min-interval settings and rebuilds if
+anything changed.
 
 ### Spend the budget where it can move the ranking
 
