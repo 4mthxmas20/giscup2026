@@ -156,17 +156,21 @@ because `atan2` differs by an ulp at the margins. The gap is 0.01% and both
 sides stay conservative, but verifying elsewhere compares against subtly
 different geometry for no reason.
 
-Then get the organizers' own verdict (runs on GitHub, not this machine):
+Then get the organizers' own verdict. Run it in the same codespace, so the
+evaluator sees exactly the geometry that produced the solution:
 
 ```bash
-git add -A && git commit -m "competition run" && git push
-gh workflow run official-eval.yml \
-  -f dataset=data/competition.geojson -f submission=results/solutions.txt
-gh run watch
+scripts/run_official_eval.sh data/competition.geojson results/solutions.txt
 ```
 
-Each of the nine jobs must report `lost=0`. Download reports with
-`gh run download <run-id>`.
+This clones the evaluator, installs its pinned dependencies (~400 MB, one
+time), and evaluates every sub-problem. Each must report `lost=0`; the report
+lands in `results/official-eval-report.json`.
+
+The `.github/workflows/official-eval.yml` workflow does the same thing on
+GitHub runners with the nine sub-problems in parallel. It is the faster option
+when the codespace is busy, but it needs the results committed and pushed
+first.
 
 ## 4. Package and submit
 
