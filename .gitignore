@@ -7,3 +7,5 @@ cache/
 *.dSYM/
 .DS_Store
 results/*.viz.png
+results/wit_*.txt
+results/*.bin
