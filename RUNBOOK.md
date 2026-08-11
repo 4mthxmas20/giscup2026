@@ -57,16 +57,30 @@ make -C cpp
 cpp/solver results/buildings.txt --probe 2000 --R 1200 --spacing 6
 ```
 
-`--probe` times a candidate sample and extrapolates. Pick R and spacing so the
-estimated visibility pass lands **under ~1 hour**:
+`--probe` times a candidate sample and extrapolates.
 
-| Dial | Effect |
-| --- | --- |
-| `--R` | cost grows roughly with R²; R=800 scores ~0.6% below R=1200 for a quarter of the time |
-| `--spacing` | candidate count scales inversely; 6→12 roughly halves both cost and candidate density |
+Measured on a 4-core codespace by tiling the sample (`python/synth_scale.py`),
+all at `--spacing 6`:
 
-Re-probe after changing dials. If the dataset is far larger than the 12,860-building
-sample, start at `--R 600 --spacing 10` and only tighten if the estimate is small.
+| Buildings | Candidates | R=600 | R=800 | R=1200 | Intervals @R=1200 |
+| --- | --- | --- | --- | --- | --- |
+| 12,860 (sample) | 183 K | — | — | 13 min | 72 MB |
+| 51,440 (2×2) | 734 K | 11.1 min | 21.6 min | 54.4 min | 309 MB |
+| 115,740 (3×3) | 1,651 K | 25.7 min | 47.6 min | 125.2 min | 711 MB |
+
+Visibility cost is **linear in building count** (2.25× the buildings cost
+2.20–2.31× the time) and grows about R²–R^2.4. Memory is a non-issue.
+
+**Raise `--spacing` before lowering `--R`.** Lower R only shortens the
+visibility pass. Candidate count scales exactly with building count, and the
+LNS rebuild rescans every candidate on each iteration — at 1.65 M candidates
+the search runs ~9× fewer iterations per second than on the sample, and search
+iterations are what actually buy score. Spacing is the only dial that cuts
+both: it shrinks the visibility pass *and* the per-iteration scan.
+
+So on a large dataset, budget backwards from search, not from visibility: a
+125-minute visibility pass is affordable inside 24 hours, but a search that
+crawls is not recoverable.
 
 ## 2. Solve
 
