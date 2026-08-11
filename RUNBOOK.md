@@ -48,10 +48,14 @@ TAUS=<from parameter file> KS=<from parameter file> \
   scripts/run_all.sh data/competition.geojson 600 <R> <spacing>
 ```
 
-`run_all.sh` prepares, solves, verifies, and packages. The third argument is
-the per-config local-search budget in seconds. Nine configs × (LS + LNS) is the
-bulk of the wall time — budget backwards from the deadline and leave **≥3 hours
-of slack**.
+`run_all.sh` prepares, solves, verifies, and packages. The second argument is
+the per-config **total** search budget in seconds, split automatically between
+1-opt and LNS (1-opt capped at a third, max 180 s — it saturates early while
+LNS keeps paying). Nine configs × that budget is the bulk of the wall time —
+budget backwards from the deadline and leave **≥3 hours of slack**.
+
+Measured on the sample at τ=0.75, k=500 with a 240 s budget: 1-opt alone
+reached 2991, adding LNS reached 3050.
 
 To split the budget explicitly, call the solver directly:
 

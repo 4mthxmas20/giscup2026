@@ -677,7 +677,10 @@ int main(int argc, char** argv) {
     }
     double R = 400, spacing = 12, eps = 1e-6, minIvLen = 0.02, lsTime = 0;
     double lnsTime = 0;
-    int maxRuin = 6;
+    // Tuned on the sample at tau=0.75/k=500: ruin 3 beat 6 and 12, because
+    // cheaper iterations buy far more of them and the greedy rebuild cannot
+    // reassemble a large ruin well.
+    int maxRuin = 3;
     std::vector<double> taus = {0.25, 0.5, 0.75};
     std::vector<double> gammas = {0.05, 0.1, 0.2, 0.4, 0.7, 1.0, 1.5};
     std::vector<int> ks = {50, 500, 1000};
