@@ -64,6 +64,24 @@ cpp/solver results/buildings.txt --R <R> --spacing <spacing> \
 `--viscache` writes the visibility table once so later re-runs with more search
 time skip the expensive pass. **Never reuse a cache across datasets.**
 
+### Strategy: bank a full result, then intensify
+
+Do a complete pass with a modest budget first so a submittable answer exists
+early, then spend the remaining hours improving whichever configs look weakest
+(highest τ, lowest k are usually furthest from saturation). `--warmstart`
+resumes from a previous solution instead of restarting from greedy:
+
+```bash
+cpp/solver results/buildings.txt --viscache cache/comp.bin \
+  --R <R> --spacing <spacing> --taus 0.75 --ks 500 \
+  --warmstart results/sol_t0.75_k500.txt --lstime 0 --lnstime 3600 \
+  --witness --out results
+```
+
+The warm-start file must come from a run with the **same dataset, R and
+spacing** — the solver checks each coordinate against the candidate set and
+refuses to start if they do not match. Re-run `verify.py` afterwards.
+
 ## 3. Verify (mandatory before submitting)
 
 ```bash

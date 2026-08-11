@@ -440,7 +440,7 @@ static void runGreedy(OptState& st, const std::vector<int>& ks, int nthreads,
 // high tau where a building needs several antennas together; removing m at once
 // lets the rebuild discover those combinations.
 static void lnsSearch(OptState& st, double seconds, int nthreads, uint64_t seed,
-                      int maxRuin) {
+                      int maxRuin, const std::vector<Candidate>& cands) {
     auto tstart = Clock::now();
     uint64_t rng = seed ? seed : 0x9e3779b97f4a7c15ull;
     auto rnd = [&]() {
@@ -451,6 +451,7 @@ static void lnsSearch(OptState& st, double seconds, int nthreads, uint64_t seed,
     int bestScore = st.score;
     std::vector<uint8_t> excl(st.isSel.size(), 0);
     std::vector<uint32_t> victims, added;
+    std::vector<std::pair<double, uint32_t>> nearest;
     int iters = 0, improves = 0, undos = 0;
 
     while (secs(tstart, Clock::now()) < seconds) {
@@ -461,12 +462,28 @@ static void lnsSearch(OptState& st, double seconds, int nthreads, uint64_t seed,
 
         victims.clear();
         added.clear();
-        for (int i = 0; i < m && !st.selected.empty(); i++) {
-            uint32_t v = st.selected[rnd() % st.selected.size()];
-            if (std::find(victims.begin(), victims.end(), v) != victims.end()) continue;
-            victims.push_back(v);
-            st.remove(v);
+        if (st.selected.empty()) break;
+        uint32_t seedAnt = st.selected[rnd() % st.selected.size()];
+        if (rnd() % 100 < 60) {
+            // Related removal: take the seed's nearest selected neighbours.
+            // Antennas serving the same block are the ones worth recombining;
+            // a scattered random set rarely has a better joint arrangement.
+            nearest.clear();
+            Pt sp = cands[seedAnt].p;
+            for (uint32_t s : st.selected)
+                nearest.push_back({norm2(cands[s].p - sp), s});
+            size_t take = std::min((size_t)m, nearest.size());
+            std::partial_sort(nearest.begin(), nearest.begin() + take, nearest.end());
+            for (size_t i = 0; i < take; i++) victims.push_back(nearest[i].second);
+        } else {
+            victims.push_back(seedAnt);
+            for (int i = 1; i < m && (int)victims.size() < m; i++) {
+                uint32_t v = st.selected[rnd() % st.selected.size()];
+                if (std::find(victims.begin(), victims.end(), v) == victims.end())
+                    victims.push_back(v);
+            }
         }
+        for (uint32_t v : victims) st.remove(v);
         if (victims.empty()) break;
 
         // Forbid the victims on the first rebuild pick so each iteration
@@ -483,7 +500,9 @@ static void lnsSearch(OptState& st, double seconds, int nthreads, uint64_t seed,
         }
         for (uint32_t v : victims) excl[v] = 0;
 
-        if (st.score < scoreBefore) {
+        // A short rebuild would silently shrink the antenna set below k, so
+        // treat it as a failed move even when the score held.
+        if (st.score < scoreBefore || added.size() != victims.size()) {
             // Undo incrementally: m removes + m adds, not a full k-add rebuild.
             for (uint32_t c : added) st.remove(c);
             for (uint32_t v : victims) st.add(v);
@@ -563,6 +582,48 @@ static void localSearch(OptState& st, double seconds, int nthreads,
                  secs(tstart, Clock::now()));
 }
 
+// Load a previous solution's antennas back into candidate indices, so a run
+// can pick up where an earlier one stopped instead of re-deriving from greedy.
+// Requires an identical candidate set (same dataset, R and spacing).
+static bool loadWarmStart(const std::string& path,
+                          const std::vector<Candidate>& cands,
+                          std::vector<uint32_t>& picks) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return false;
+    char line[64];
+    if (!std::fgets(line, sizeof line, f)) { std::fclose(f); return false; }
+    std::string coords;
+    int ch;
+    while ((ch = std::fgetc(f)) != EOF && ch != '\n') coords.push_back((char)ch);
+    std::fclose(f);
+
+    std::map<std::pair<double, double>, uint32_t> byPoint;
+    for (size_t i = 0; i < cands.size(); i++)
+        byPoint.emplace(std::make_pair(cands[i].p.x, cands[i].p.y), (uint32_t)i);
+
+    picks.clear();
+    size_t pos = 0;
+    while (pos < coords.size()) {
+        size_t sep = coords.find(';', pos);
+        std::string tok = coords.substr(pos, sep == std::string::npos
+                                                 ? std::string::npos : sep - pos);
+        double x = 0, y = 0;
+        if (std::sscanf(tok.c_str(), "%lf %lf", &x, &y) == 2) {
+            auto it = byPoint.find({x, y});
+            if (it == byPoint.end()) {
+                std::fprintf(stderr,
+                             "warmstart: (%.17g, %.17g) is not in the candidate "
+                             "set; R/spacing must match the original run\n", x, y);
+                return false;
+            }
+            picks.push_back(it->second);
+        }
+        if (sep == std::string::npos) break;
+        pos = sep + 1;
+    }
+    return !picks.empty();
+}
+
 // ---------------------------------------------------------------- vis cache
 // Cache format: [ncand u64][off (ncand+1) u64][ndata u64][IvRec...][cand p/q/bld]
 static bool saveVis(const std::string& path, const VisTable& vt,
@@ -621,7 +682,7 @@ int main(int argc, char** argv) {
     std::vector<double> gammas = {0.05, 0.1, 0.2, 0.4, 0.7, 1.0, 1.5};
     std::vector<int> ks = {50, 500, 1000};
     std::string outDir = "results";
-    std::string visCache;
+    std::string visCache, warmStart;
     int nthreads = (int)std::thread::hardware_concurrency();
     bool testvis = false, witness = false;
     int probeN = 0;
@@ -641,6 +702,7 @@ int main(int argc, char** argv) {
         else if (is("--viscache")) visCache = argv[++i];
         else if (is("--witness")) witness = true;
         else if (is("--probe")) probeN = std::atoi(argv[++i]);
+        else if (is("--warmstart")) warmStart = argv[++i];
         else if (is("--taus")) taus = parseList(argv[++i]);
         else if (is("--ks")) {
             ks.clear();
@@ -728,7 +790,24 @@ int main(int argc, char** argv) {
             std::vector<uint32_t> picks;
         };
         std::map<int, Best> best;
+        std::vector<uint32_t> warmPicks;
+        bool warm = !warmStart.empty() && loadWarmStart(warmStart, cands, warmPicks);
+        if (warm) {
+            std::fprintf(stderr, "warmstart: %zu antennas from %s\n",
+                         warmPicks.size(), warmStart.c_str());
+            bool matched = false;
+            for (int k : ks)
+                if ((int)warmPicks.size() == k) { best[k] = {0, 0, warmPicks}; matched = true; }
+            if (!matched) {
+                std::fprintf(stderr,
+                             "FATAL: warmstart has %zu antennas, which matches no "
+                             "requested k; pass --ks %zu\n",
+                             warmPicks.size(), warmPicks.size());
+                return 2;
+            }
+        }
         for (double g : gammas) {
+            if (warm) break;  // the warm solution already beats a fresh greedy
             OptState st;
             st.init(ds, vt, tau, g);
             GreedyResult res;
@@ -749,7 +828,23 @@ int main(int argc, char** argv) {
             int g0 = st.score;
             if (lsTime > 0) localSearch(st, lsTime, nthreads, 12345 + k);
             int g1 = st.score;
-            if (lnsTime > 0) lnsSearch(st, lnsTime, nthreads, 999 + k, maxRuin);
+            if (lnsTime > 0)
+                lnsSearch(st, lnsTime, nthreads, 999 + k, maxRuin, cands);
+
+            // Incremental add/remove bookkeeping drives the whole search; a
+            // drift here would silently optimize a phantom objective, so
+            // recompute the score from the final antenna set and compare.
+            {
+                int incremental = st.score;
+                std::vector<uint32_t> finalSel = st.selected;
+                st.setSelection(finalSel);
+                if (st.score != incremental) {
+                    std::fprintf(stderr,
+                                 "FATAL: score drift tau=%g k=%d incremental=%d "
+                                 "recomputed=%d\n", tau, k, incremental, st.score);
+                    return 2;
+                }
+            }
             std::fprintf(stderr,
                          "tau=%.2f k=%d: greedy %d (gamma=%.2f) -> ls %d -> lns %d / %zu\n",
                          tau, k, g0, b.gamma, g1, st.score, ds.blds.size());
