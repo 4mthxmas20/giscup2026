@@ -95,6 +95,33 @@ cpp/solver results/buildings.txt --R <R> --spacing <spacing> \
 `--viscache` writes the visibility table once so later re-runs with more search
 time skip the expensive pass. **Never reuse a cache across datasets.**
 
+### Spend the budget where it can move the ranking
+
+Scoring is relative — each config contributes `mine / best_submitted`, capped at
+1. A config everyone nearly saturates cannot differentiate anyone, so extra
+search there buys close to nothing.
+
+On the sample, τ=0.25/k=1000 reaches 12841 of 12860 buildings (99.9%): every
+serious entry will score ~1.0 on it. τ=0.75/k=50 reaches 302 of 12860 (2.3%) —
+that is where solutions actually spread out.
+
+So do **not** split the budget evenly. Give the low-τ / high-k configs a short
+pass and pour the remaining hours into high-τ / low-k, which stay far from
+saturation and keep improving under LNS:
+
+```bash
+# cheap pass on the near-saturated configs
+cpp/solver results/buildings.txt --viscache cache/comp.bin \
+  --taus 0.25 --ks 50,500,1000 --lstime 60 --lnstime 120 --witness --out results
+
+# everything else goes to the hard end
+cpp/solver results/buildings.txt --viscache cache/comp.bin \
+  --taus 0.75 --ks 50 --lstime 180 --lnstime 5400 --witness --out results
+```
+
+Check saturation before deciding: if a config already claims >95% of buildings,
+it is done.
+
 ### Strategy: bank a full result, then intensify
 
 Do a complete pass with a modest budget first so a submittable answer exists
