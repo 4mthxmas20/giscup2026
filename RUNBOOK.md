@@ -122,6 +122,13 @@ python3 python/verify.py data/competition.geojson results --samples 20
 Every config must print `OK`. Anything else means claims are being
 over-reported — fix before packaging, never submit a `FAIL`.
 
+Run this **on the machine that produced the solution**. The sweep is not
+bit-reproducible across platforms — the same dataset at R=1200 yielded
+6,011,070 intervals on macOS/clang and 6,010,413 in the Linux codespace,
+because `atan2` differs by an ulp at the margins. The gap is 0.01% and both
+sides stay conservative, but verifying elsewhere compares against subtly
+different geometry for no reason.
+
 Then get the organizers' own verdict (runs on GitHub, not this machine):
 
 ```bash
