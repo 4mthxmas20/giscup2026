@@ -18,6 +18,12 @@ EVAL_DIR="${EVAL_DIR:-$HOME/gis-cup-evaluator}"
 [ -f "$DATASET" ] || { echo "missing dataset: $DATASET" >&2; exit 1; }
 [ -f "$SUBMISSION" ] || { echo "missing submission: $SUBMISSION" >&2; exit 1; }
 
+# The evaluator runs from its own checkout, so relative inputs would resolve
+# against the wrong directory once we cd there.
+abspath() { (cd "$(dirname "$1")" && printf '%s/%s\n' "$(pwd)" "$(basename "$1")"); }
+DATASET="$(abspath "$DATASET")"
+SUBMISSION="$(abspath "$SUBMISSION")"
+
 if [ ! -d "$EVAL_DIR/.git" ]; then
     echo "== cloning official evaluator =="
     git clone --depth 1 https://github.com/alowe/gis-cup-2026-evaluator "$EVAL_DIR"
