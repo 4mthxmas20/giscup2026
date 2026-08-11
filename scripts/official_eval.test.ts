@@ -22,16 +22,25 @@ test("official evaluator agrees with our claimed service scores", async () => {
 
   const dataset = parseBuildingDatasetText(readFileSync(datasetPath, "utf8"));
   const parsed = parseSolutionText(readFileSync(submissionPath, "utf8"));
+  // Optional 1-based filter so CI can fan the nine sub-problems out in parallel.
+  const only = process.env.SUBPROBLEM === undefined
+    ? undefined
+    : Number(process.env.SUBPROBLEM);
+  const selected = only === undefined
+    ? parsed.subproblems
+    : parsed.subproblems.filter((subproblem) => subproblem.index === only);
+  if (selected.length === 0) throw new Error(`No sub-problem matched SUBPROBLEM=${only}`);
   console.log(
     `\nDATASET ${datasetPath}\n  buildings=${dataset.buildings.length} edges=${dataset.edgeCount}`
-    + `\nSUBMISSION ${submissionPath}\n  subproblems=${parsed.subproblems.length}`,
+    + `\nSUBMISSION ${submissionPath}\n  subproblems=${parsed.subproblems.length}`
+    + ` evaluating=${selected.length}`,
   );
 
   const rows: unknown[] = [];
   let totalClaimed = 0;
   let totalVerified = 0;
 
-  for (const source of parsed.subproblems) {
+  for (const source of selected) {
     const validated = validateSubproblemInput(source, dataset);
     const started = performance.now();
     const result = await evaluateValidatedSubproblemAsync(dataset, validated, {});

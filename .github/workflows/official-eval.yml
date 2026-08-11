@@ -1,0 +1,64 @@
+name: Official evaluator check
+
+# Runs the organizers' evaluator against our submission on GitHub runners so
+# the ~400 MB of ArcGIS/node deps never touch a local machine. The nine
+# sub-problems fan out in parallel; each job fails if any claimed building
+# does not survive the official geometry engine.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Dataset path in this repo
+        default: data/GIS-cup-sample-dataset.geojson
+      submission:
+        description: Submission path in this repo
+        default: results/solutions.txt
+
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        subproblem: [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: solution
+
+      - uses: actions/checkout@v4
+        with:
+          repository: alowe/gis-cup-2026-evaluator
+          path: evaluator
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install pinned evaluator dependencies
+        working-directory: evaluator
+        run: |
+          npm install -g pnpm@11.16.0
+          pnpm install --frozen-lockfile
+
+      - name: Evaluate sub-problem ${{ matrix.subproblem }}
+        working-directory: evaluator
+        env:
+          DATASET: ${{ github.workspace }}/solution/${{ inputs.dataset }}
+          SUBMISSION: ${{ github.workspace }}/solution/${{ inputs.submission }}
+          REPORT: ${{ github.workspace }}/report-${{ matrix.subproblem }}.json
+          SUBPROBLEM: ${{ matrix.subproblem }}
+        run: |
+          cp "$GITHUB_WORKSPACE/solution/scripts/official_eval.test.ts" \
+             benchmarks/official_eval.test.ts
+          npx vitest run --config vitest.benchmark.config.ts \
+            benchmarks/official_eval.test.ts --reporter=verbose
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-${{ matrix.subproblem }}
+          path: report-${{ matrix.subproblem }}.json
+          if-no-files-found: ignore
