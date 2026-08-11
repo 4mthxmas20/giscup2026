@@ -200,3 +200,6 @@ README with build and run instructions). Upload to EasyChair.
 | Visibility pass runs hours | R or spacing too aggressive for the dataset | re-probe, lower R first |
 | `verify.py` reports `cov_fail` | solver/verifier threshold drift | do not submit; investigate the witness file for that config |
 | Evaluator reports `ANTENNA_OFF_BOUNDARY` | antenna >1 mm from any boundary | should be impossible; candidates are exact boundary points |
+| `results/` suddenly holds only inputs | `git stash -u` swept the untracked outputs away | `git stash pop`; never run `stash -u`, `clean`, or `checkout .` in the workspace holding a finished run |
+| Evaluator dies instantly with `ENOENT` | relative dataset/submission path, resolved against the evaluator checkout | fixed in `run_official_eval.sh`; pass absolute paths if calling vitest by hand |
+| `git pull` in the codespace asks for a username | the SSH-exec context has no git credentials | push from the local clone and use `gh codespace cp` to copy individual files in |
