@@ -8,6 +8,33 @@ Sources: `https://github.com/alowe/gis-cup-2026-evaluator` →
 `datasets/GIS-cup-competition-dataset.geojson` and
 `datasets/competition-parameters.txt`.
 
+## Where to run
+
+All compute runs on a Codespace, not the local machine.
+
+```bash
+gh codespace create -R 4mthxmas20/giscup2026 -b main \
+  -m standardLinux32gb --idle-timeout 240m --retention-period 72h
+gh codespace ssh -c <name> -- "cd /workspaces/giscup2026 && <command>"
+```
+
+`standardLinux32gb` (4 cores, 16 GB) is the largest machine this account can
+use. **`.devcontainer/devcontainer.json` must not request more than that** —
+`hostRequirements` above the ceiling filters every machine out and creation
+fails with "no available machine types", which looks like a quota problem but
+is not.
+
+Four cores means roughly double the wall time of an 8-core laptop; scale the
+budget estimates below accordingly. Start long runs detached so the SSH session
+is not load-bearing:
+
+```bash
+gh codespace ssh -c <name> -- "cd /workspaces/giscup2026 && nohup bash -c '<pipeline>' > run.log 2>&1 & echo LAUNCHED"
+```
+
+Codespaces bill by the core-hour and the machine keeps running until the idle
+timeout, so stop it when the work is done: `gh codespace stop -c <name>`.
+
 ## 0. Get the data (T+0)
 
 ```bash
