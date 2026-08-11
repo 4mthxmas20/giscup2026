@@ -51,6 +51,17 @@ def main():
         raise SystemExit(f"no sol_t*_k*.txt found in {args.soldir}")
     print(f"configs: {', '.join(f'({t}, {k})' for t, k in configs)}")
 
+    # Solver output stores 0-based indices, so pairing it with a newer ID map
+    # would silently emit the wrong building IDs. Refuse stale files outright.
+    ids_mtime = os.path.getmtime(ids_path)
+    stale = [f"sol_t{t}_k{k}.txt" for t, k in configs
+             if os.path.getmtime(os.path.join(args.soldir, f"sol_t{t}_k{k}.txt"))
+             < ids_mtime]
+    if stale:
+        raise SystemExit(
+            f"stale solver output (older than {os.path.basename(ids_path)}): "
+            f"{', '.join(stale)}\nre-run the solver before packaging")
+
     blocks = []
     for tau, k in configs:
         path = os.path.join(args.soldir, f"sol_t{tau}_k{k}.txt")
