@@ -39,10 +39,32 @@ fi
 
 cp "$REPO_ROOT/scripts/official_eval.test.ts" benchmarks/official_eval.test.ts
 
-echo "== evaluating =="
-DATASET="$DATASET" SUBMISSION="$SUBMISSION" \
-    REPORT="$REPO_ROOT/results/official-eval-report.json" \
-    npx vitest run --config vitest.benchmark.config.ts \
-    benchmarks/official_eval.test.ts --reporter=verbose 2>&1 | tee "$REPO_ROOT/results/official-eval.log"
+# One vitest run per sub-problem. Evaluating all nine in a single test blows
+# past vitest's per-test timeout, and a late failure would discard the earlier
+# results; per-sub-problem runs finish well inside the limit and each one's
+# verdict is durable.
+COUNT=$(( $(grep -c '' "$SUBMISSION") / 3 ))
+echo "== evaluating $COUNT sub-problems =="
+LOG="$REPO_ROOT/results/official-eval.log"
+: > "$LOG"
+FAILED=0
+for i in $(seq 1 "$COUNT"); do
+    echo "-- sub-problem $i/$COUNT --" | tee -a "$LOG"
+    if ! DATASET="$DATASET" SUBMISSION="$SUBMISSION" SUBPROBLEM="$i" \
+        REPORT="$REPO_ROOT/results/official-eval-report-$i.json" \
+        npx vitest run --config vitest.benchmark.config.ts \
+        --testTimeout=3600000 \
+        benchmarks/official_eval.test.ts --reporter=verbose 2>&1 | tee -a "$LOG"
+    then
+        FAILED=1
+    fi
+done
 
-echo "== report: $REPO_ROOT/results/official-eval-report.json =="
+echo "== summary ==" | tee -a "$LOG"
+grep -oE '"tau":[0-9.]+,"k":[0-9]+.*"lost":[0-9]+' "$LOG" \
+    | sed 's/"antennas[A-Za-z]*":[0-9]*,//g' | tee -a "$LOG"
+if [ "$FAILED" -ne 0 ]; then
+    echo "SOME SUB-PROBLEMS FAILED — do not submit until resolved" | tee -a "$LOG"
+    exit 1
+fi
+echo "all sub-problems verified; reports in $REPO_ROOT/results/" | tee -a "$LOG"
