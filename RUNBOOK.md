@@ -94,14 +94,20 @@ cpp/solver results/buildings.txt --probe 2000 --R 1200 --spacing 6
 
 `--probe` times a candidate sample and extrapolates.
 
-Measured on a 4-core codespace by tiling the sample (`python/synth_scale.py`),
-all at `--spacing 6`:
+Measured on a **4-core codespace** by tiling the sample
+(`python/synth_scale.py`), all at `--spacing 6`:
 
 | Buildings | Candidates | R=600 | R=800 | R=1200 | Intervals @R=1200 |
 | --- | --- | --- | --- | --- | --- |
 | 12,860 (sample) | 183 K | — | — | 13 min | 72 MB |
 | 51,440 (2×2) | 734 K | 11.1 min | 21.6 min | 54.4 min | 309 MB |
 | 115,740 (3×3) | 1,651 K | 25.7 min | 47.6 min | 125.2 min | 711 MB |
+
+**Double these for Actions**, whose private-repo runners are 2-core: the
+sample at R=1200 measured 25.2 min there against 13 min on the codespace. At
+3×3 scale that projects to ~4 hours, uncomfortably close to the 6-hour job
+ceiling — if the evaluation dataset is that large, lower R or raise spacing in
+`prepare` rather than risk a timeout that wastes the whole run.
 
 Visibility cost is **linear in building count** (2.25× the buildings cost
 2.20–2.31× the time) and grows about R²–R^2.4. Memory is a non-issue.
@@ -116,6 +122,40 @@ both: it shrinks the visibility pass *and* the per-iteration scan.
 So on a large dataset, budget backwards from search, not from visibility: a
 125-minute visibility pass is affordable inside 24 hours, but a search that
 crawls is not recoverable.
+
+## Parameter templates
+
+GitHub-hosted runners on a **private** repo are **2-core** — half the
+codespace, and every timing below accounts for that. Billing is $0.008/min
+beyond the monthly free minutes, so the plan has to fit the spending limit as
+well as the deadline.
+
+**Round one — bank a submittable answer.** Roughly 1,800 runner-minutes.
+
+```
+budget_easy=1800  budget_hard=7200  seeds_hard=2
+```
+
+**Round two — attack what is far from saturation.** Re-dispatch with
+`taus`/`ks` narrowed to the hard configurations only; the visibility cache is
+already warm, so the run goes straight to searching.
+
+With a $30 limit (~3,750 paid minutes) the choice is one of these, **not
+both**:
+
+| | Shape | Cost |
+| --- | --- | --- |
+| A | `budget_hard=14400` (4 h) × `seeds_hard=2` | ~3,000 min |
+| B | `budget_hard=7200` (2 h) × `seeds_hard=5` | ~3,900 min |
+
+**Prefer B.** The seed spread is measured (5.8% between two seeds at
+τ=0.75/k=50); the return on a longer single run is extrapolated — LNS was still
+improving at 160 s, and there is no data past that. B also fails better: a
+4-hour job that dies at 3:50 loses everything, while one of five 2-hour jobs
+dying costs a fifth.
+
+Leave headroom. If the spending limit is hard, hitting it mid-run kills jobs
+that are already in flight.
 
 ## 2. Solve — dispatch the workflow
 
