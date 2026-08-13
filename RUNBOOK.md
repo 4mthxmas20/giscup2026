@@ -123,39 +123,86 @@ So on a large dataset, budget backwards from search, not from visibility: a
 125-minute visibility pass is affordable inside 24 hours, but a search that
 crawls is not recoverable.
 
-## Parameter templates
+## The three rounds
 
 GitHub-hosted runners on a **private** repo are **2-core** — half the
-codespace, and every timing below accounts for that. Billing is $0.008/min
-beyond the monthly free minutes, so the plan has to fit the spending limit as
-well as the deadline.
+codespace, and every timing here accounts for that. Billing is $0.008/min
+beyond the monthly free minutes; budgets are Actions $50, Codespaces $20.
+The three rounds together come to roughly 7,500 runner-minutes ≈ $44.
 
-**Round one — bank a submittable answer.** Roughly 1,800 runner-minutes.
+**Rank configurations by marginal return to search, not by coverage.** What
+matters is how much more search still buys. Measured on the sample, going from
+1-opt to LNS gained:
 
-```
-budget_easy=1800  budget_hard=7200  seeds_hard=2
-```
-
-**Round two — attack what is far from saturation.** Re-dispatch with
-`taus`/`ks` narrowed to the hard configurations only; the visibility cache is
-already warm, so the run goes straight to searching.
-
-With a $30 limit (~3,750 paid minutes) the choice is one of these, **not
-both**:
-
-| | Shape | Cost |
+| Configuration | Gain | Round-two priority |
 | --- | --- | --- |
-| A | `budget_hard=14400` (4 h) × `seeds_hard=2` | ~3,000 min |
-| B | `budget_hard=7200` (2 h) × `seeds_hard=5` | ~3,900 min |
+| τ=0.75, k=50 | **+8.9%** | 1 |
+| τ=0.5, k=50 | +5.3% | 2 |
+| τ=0.75, k=500 | +3.7% | 3 |
+| τ=0.75, k=1000 | +2.6% | 4 |
+| τ=0.5, k=500 | +1.4% | 5 |
+| τ=0.5, k=1000 | +1.0% | 6 |
+| τ=0.25, all k | +0.6–0.7% | skip |
 
-**Prefer B.** The seed spread is measured (5.8% between two seeds at
-τ=0.75/k=50); the return on a longer single run is extrapolated — LNS was still
-improving at 160 s, and there is no data past that. B also fails better: a
-4-hour job that dies at 3:50 loses everything, while one of five 2-hour jobs
-dying costs a fifth.
+τ=0.25 configurations barely move under more search — that is what makes them
+"easy", not their coverage (τ=0.25/k=50 only reaches 18.6%, yet extra hours buy
+almost nothing there).
 
-Leave headroom. If the spending limit is hard, hitting it mid-run kills jobs
-that are already in flight.
+### Round one — bank a submittable answer
+
+```
+budget_easy=1800  budget_hard=7200  seeds_hard=2   (~1,820 min)
+easy_taus=0.25
+```
+
+Goal is not the best score; it is a complete nine-configuration answer with
+`lost=0`, downloaded and **submitted to EasyChair before anything else**.
+
+Note the tool's granularity: `easy_taus` selects whole τ values, so τ=0.5/k=1000
+cannot be marked easy on its own and will draw the hard budget. That costs
+~220 extra minutes and is not worth working around — it sits at 79% coverage
+and the time is not wasted on it.
+
+### Round two — hard configurations only
+
+With round one submitted, re-dispatch narrowed to the hard set. The visibility
+cache is warm, so the run goes straight to searching.
+
+```
+taus=0.5,0.75  ks=50,500,1000  budget_hard=7200  seeds_hard=5   (~4,000 min)
+```
+
+Two hours × five seeds is preferred over four hours × two: the seed spread is
+**measured** (5.8% between seeds at τ=0.75/k=50) while the return on a longer
+single run is **extrapolated** — LNS was still improving at 160 s and there is
+no data past that. Shorter jobs also fail better; a four-hour job that dies at
+3:50 loses everything.
+
+If time or budget tightens, keep the top three: τ=0.75/k=50, τ=0.5/k=50,
+τ=0.75/k=500.
+
+### Round three — patch the weakest
+
+Pick the one to three configurations that still look weakest relative to their
+headroom, and warm-start from the best solution so far:
+
+```
+budget_hard=7200..10800  seeds_hard=3..5  --warmstart <best sol_*.txt>
+```
+
+`--refine` belongs here and nowhere else — it is off by default because a short
+test measured it losing (candidates +138%, score 71→70). Treat it as an
+experiment against a banked result, never as part of the main path.
+
+### Rules that override any of the above
+
+- **`lost > 0` is never submitted.** Whatever the score says.
+- Never split the budget evenly across configurations.
+- `budget_hard=7200` is two hours **per configuration, concurrently** — not two
+  hours total, and not nine configurations × two hours serially.
+- If `prepare`'s probe projects anywhere near the 6-hour job ceiling, raise
+  `spacing` first, then lower `R`. A timeout wastes the entire round.
+- Leave spending headroom: a hard limit reached mid-run kills jobs in flight.
 
 ## 2. Solve — dispatch the workflow
 
