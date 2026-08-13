@@ -117,18 +117,41 @@ So on a large dataset, budget backwards from search, not from visibility: a
 125-minute visibility pass is affordable inside 24 hours, but a search that
 crawls is not recoverable.
 
-## 2. Solve
+## 2. Solve — dispatch the workflow
 
 ```bash
-TAUS=<from parameter file> KS=<from parameter file> \
-  scripts/run_all.sh data/competition.geojson 600 <R> <spacing>
+gh workflow run competition.yml \
+  -f dataset=data/competition.geojson \
+  -f taus=<from parameter file> -f ks=<from parameter file> \
+  -f R=<from probe> -f spacing=<from probe> \
+  -f budget_easy=900 -f budget_hard=7200 -f seeds_hard=3
+gh run watch
 ```
 
-`run_all.sh` prepares, solves, verifies, and packages. The second argument is
-the per-config **total** search budget in seconds, split automatically between
-1-opt and LNS (1-opt capped at a third, max 180 s — it saturates early while
-LNS keeps paying). Nine configs × that budget is the bulk of the wall time —
-budget backwards from the deadline and leave **≥3 hours of slack**.
+Budgets are **per configuration and concurrent**: `budget_hard=7200` means
+results in roughly two hours, not eighteen. Each budget is split internally
+between 1-opt and LNS (1-opt capped at a third, max 180 s — it saturates early
+while LNS keeps paying).
+
+Write τ values exactly as the solver prints them (`0.5`, not `0.50`) — job
+artifact names are built from these strings and must match the solver's output
+filenames.
+
+`seeds_hard` runs independent searches per hard configuration and keeps the
+best. Rehearsal measured a 5.8% spread between two seeds at τ=0.75/k=50, and
+seeds cost minutes without costing wall time, so 3–5 is worthwhile wherever a
+configuration is far from saturation.
+
+### Serial fallback (Codespace)
+
+Only when Actions is unavailable, or to debug interactively:
+
+```bash
+TAUS=<taus> KS=<ks> scripts/run_all.sh data/competition.geojson 600 <R> <spacing>
+```
+
+This runs the nine configurations one after another on a single machine, so
+wall time is nine budgets, not one.
 
 Measured on the sample at τ=0.75, k=500 with a 240 s budget: 1-opt alone
 reached 2991, adding LNS reached 3050.
@@ -193,45 +216,61 @@ refuses to start if they do not match. Re-run `verify.py` afterwards.
 
 ## 3. Verify (mandatory before submitting)
 
+The workflow already does both layers, in parallel:
+
+- each `search` job runs `verify.py` on its own configuration, so a claim that
+  fails never reaches the packaging step;
+- `official-eval` re-checks the packaged `solutions.txt` with the organizers'
+  evaluator, one runner per index in `subproblems.json`.
+
+**Read the `official-eval` jobs before submitting.** Every one must report
+`lost=0`. A red job means claims are being over-reported — never submit it.
+
+Verification runs on the same runner image that produced the solution, which
+matters: the sweep is not bit-reproducible across platforms — the same dataset
+at R=1200 yielded 6,011,070 intervals on macOS/clang and 6,010,413 on Linux,
+because `atan2` differs by an ulp at the margins. The gap is 0.01% and both
+sides stay conservative, but verifying against subtly different geometry
+invites confusion for no gain. For the same reason, do not verify a
+Codespace-produced solution on Actions or vice versa.
+
+Manual equivalents, for the serial fallback:
+
 ```bash
 python3 python/verify.py data/competition.geojson results --samples 20
-```
-
-Every config must print `OK`. Anything else means claims are being
-over-reported — fix before packaging, never submit a `FAIL`.
-
-Run this **on the machine that produced the solution**. The sweep is not
-bit-reproducible across platforms — the same dataset at R=1200 yielded
-6,011,070 intervals on macOS/clang and 6,010,413 in the Linux codespace,
-because `atan2` differs by an ulp at the margins. The gap is 0.01% and both
-sides stay conservative, but verifying elsewhere compares against subtly
-different geometry for no reason.
-
-Then get the organizers' own verdict. Run it in the same codespace, so the
-evaluator sees exactly the geometry that produced the solution:
-
-```bash
 scripts/run_official_eval.sh data/competition.geojson results/solutions.txt
 ```
 
-This clones the evaluator, installs its pinned dependencies (~400 MB, one
-time), and evaluates every sub-problem. Each must report `lost=0`; the report
-lands in `results/official-eval-report.json`.
-
-The `.github/workflows/official-eval.yml` workflow does the same thing on
-GitHub runners with the nine sub-problems in parallel. It is the faster option
-when the codespace is busy, but it needs the results committed and pushed
-first.
+`.github/workflows/official-eval.yml` is the standalone version; note it reads
+`results/solutions.txt` **from the repository**, so it only checks committed
+results — a competition run's output lives in an artifact and is covered by the
+`official-eval` stage inside `competition.yml` instead.
 
 ## 4. Package and submit
 
+`aggregate` already built the archive. Once `official-eval` is green:
+
 ```bash
-python3 python/make_submission.py results results/submission.zip
-unzip -l results/submission.zip
+gh run download <run-id> -n submission -D submission
+unzip -l submission/submission.zip
 ```
 
 The archive holds `solutions.txt` plus `source/` (C++ core, Python tooling,
 README with build and run instructions). Upload to EasyChair.
+
+Manual equivalent for the serial fallback:
+
+```bash
+python3 python/make_submission.py results results/submission.zip
+```
+
+### Then keep going
+
+The first green run is the safety net, not the answer. With it banked, spend
+the remaining hours on the configurations furthest from saturation: raise
+`budget_hard`, raise `seeds_hard`, and re-dispatch. The visibility cache is
+already warm, so a re-run skips straight to searching. Submit again whenever a
+run beats the banked one and is green.
 
 ## Pre-flight checklist
 
