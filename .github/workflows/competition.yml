@@ -34,6 +34,9 @@ on:
       spacing:
         description: Candidate spacing (m)
         default: "6"
+      minivlen:
+        description: Drop visible intervals shorter than this (m)
+        default: "0.02"
       budget_easy:
         description: Search seconds for configs that saturate (low tau, high k)
         default: "120"
@@ -56,6 +59,7 @@ jobs:
     timeout-minutes: 300
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      evalmatrix: ${{ steps.plan.outputs.evalmatrix }}
       cache_key: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@v4
@@ -76,8 +80,12 @@ jobs:
       - name: Compute cache key
         id: key
         run: |
+          # Actions caches are immutable, so every input that changes the table
+          # must be in the key. Otherwise a changed parameter would restore a
+          # stale entry, get rejected by the solver's fingerprint, recompute —
+          # and then fail to save, making every search job recompute too.
           H=$(sha256sum results/buildings.txt | cut -c1-32)
-          echo "key=vis-$H-R${{ inputs.R }}-S${{ inputs.spacing }}-v2" >> "$GITHUB_OUTPUT"
+          echo "key=vis-$H-R${{ inputs.R }}-S${{ inputs.spacing }}-M${{ inputs.minivlen }}-v2" >> "$GITHUB_OUTPUT"
 
       - name: Restore visibility cache
         id: viscache
@@ -90,11 +98,13 @@ jobs:
         if: steps.viscache.outputs.cache-hit != 'true'
         run: |
           cpp/solver results/buildings.txt --R "${{ inputs.R }}" \
-            --spacing "${{ inputs.spacing }}" --viscache cache/vis.bin --visonly
+            --spacing "${{ inputs.spacing }}" --minivlen "${{ inputs.minivlen }}" \
+            --viscache cache/vis.bin --visonly
           ls -la cache/vis.bin
 
       - name: Save visibility cache
         if: steps.viscache.outputs.cache-hit != 'true'
+        continue-on-error: true  # a concurrent run may have saved this key first
         uses: actions/cache/save@v4
         with:
           path: cache/vis.bin
@@ -139,6 +149,10 @@ jobs:
                   for s in range(1 if is_easy else seeds_hard):
                       entries.append({"tau": t, "k": k, "seed": s, "budget": budget})
           print("matrix=" + json.dumps({"include": entries}))
+          # solutions.txt carries one block per (tau, k); the evaluator matrix
+          # indexes those, not the seeded search jobs.
+          print("evalmatrix=" + json.dumps(
+              {"subproblem": list(range(1, len(taus) * len(ks) + 1))}))
           PY
 
   search:
@@ -187,10 +201,16 @@ jobs:
           LNS=$(( BUDGET - LS ))
           cpp/solver results/buildings.txt \
             --R "${{ inputs.R }}" --spacing "${{ inputs.spacing }}" \
-            --viscache cache/vis.bin \
+            --minivlen "${{ inputs.minivlen }}" --viscache cache/vis.bin \
             --taus "${{ matrix.tau }}" --ks "${{ matrix.k }}" \
             --lstime "$LS" --lnstime "$LNS" --seed "${{ matrix.seed }}" \
-            --witness --out results
+            --witness --out results 2>&1 | tee solve.log
+          # Signal 2: this must have reused the shared table, not rebuilt it.
+          if grep -q "loaded vis cache" solve.log; then
+            echo "cache reused"
+          else
+            echo "::warning::visibility was recomputed in this search job"
+          fi
 
       - name: Verify this configuration
         run: |
@@ -242,3 +262,55 @@ jobs:
             results/solutions.txt
             results/submission.zip
           retention-days: 7
+
+  # The standalone official-eval workflow reads solutions.txt from the repo,
+  # which a competition run never commits — so the loop only closes if the
+  # evaluator consumes the artifact this run just produced.
+  official-eval:
+    needs: [prepare, aggregate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.evalmatrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: solution }
+      - uses: actions/checkout@v4
+        with:
+          repository: alowe/gis-cup-2026-evaluator
+          path: evaluator
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+
+      - uses: actions/download-artifact@v4
+        with: { name: prep, path: shared }
+      - uses: actions/download-artifact@v4
+        with: { name: submission, path: shared }
+
+      - name: Install pinned evaluator dependencies
+        working-directory: evaluator
+        run: |
+          npm install -g pnpm@11.16.0
+          pnpm install --frozen-lockfile
+
+      - name: Evaluate sub-problem ${{ matrix.subproblem }}
+        working-directory: evaluator
+        env:
+          DATASET: ${{ github.workspace }}/shared/dataset.geojson
+          SUBMISSION: ${{ github.workspace }}/shared/solutions.txt
+          REPORT: ${{ github.workspace }}/report-${{ matrix.subproblem }}.json
+          SUBPROBLEM: ${{ matrix.subproblem }}
+        run: |
+          cp "$GITHUB_WORKSPACE/solution/scripts/official_eval.test.ts" \
+             benchmarks/official_eval.test.ts
+          npx vitest run --config vitest.benchmark.config.ts \
+            --testTimeout=3600000 \
+            benchmarks/official_eval.test.ts --reporter=verbose
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: official-report-${{ matrix.subproblem }}
+          path: report-${{ matrix.subproblem }}.json
+          if-no-files-found: ignore
