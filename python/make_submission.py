@@ -82,6 +82,15 @@ def main():
         f.write("".join(blocks))
     print(f"wrote {sol_txt}")
 
+    # Single source of truth for which block is which. Anything that evaluates
+    # solutions.txt by position (the official evaluator selects sub-problems by
+    # index) should read this rather than re-deriving the order.
+    index_path = os.path.join(args.soldir, "subproblems.json")
+    with open(index_path, "w") as f:
+        json.dump([{"index": i + 1, "tau": t, "k": int(k)}
+                   for i, (t, k) in enumerate(configs)], f, indent=1)
+    print(f"wrote {index_path}")
+
     with zipfile.ZipFile(args.out, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(sol_txt, "solutions.txt")
         for rel in ["README.md", "cpp/Makefile", "cpp/solver.cpp",

@@ -59,7 +59,6 @@ jobs:
     timeout-minutes: 300
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
-      evalmatrix: ${{ steps.plan.outputs.evalmatrix }}
       cache_key: ${{ steps.key.outputs.key }}
     steps:
       - uses: actions/checkout@v4
@@ -79,13 +78,20 @@ jobs:
 
       - name: Compute cache key
         id: key
+        env:
+          # The solver's cache fingerprint covers the dataset and the geometry
+          # parameters but has no notion of code version, so a change to the
+          # sweep would silently reuse a table built by the previous logic.
+          # Hashing the geometry sources closes that hole.
+          CODE_HASH: ${{ hashFiles('cpp/solver.cpp', 'cpp/visibility.hpp', 'cpp/geometry.hpp', 'cpp/grid.hpp') }}
         run: |
           # Actions caches are immutable, so every input that changes the table
           # must be in the key. Otherwise a changed parameter would restore a
           # stale entry, get rejected by the solver's fingerprint, recompute —
           # and then fail to save, making every search job recompute too.
           H=$(sha256sum results/buildings.txt | cut -c1-32)
-          echo "key=vis-$H-R${{ inputs.R }}-S${{ inputs.spacing }}-M${{ inputs.minivlen }}-v2" >> "$GITHUB_OUTPUT"
+          C=$(echo "$CODE_HASH" | cut -c1-12)
+          echo "key=vis-$H-R${{ inputs.R }}-S${{ inputs.spacing }}-M${{ inputs.minivlen }}-c$C" >> "$GITHUB_OUTPUT"
 
       - name: Restore visibility cache
         id: viscache
@@ -149,10 +155,6 @@ jobs:
                   for s in range(1 if is_easy else seeds_hard):
                       entries.append({"tau": t, "k": k, "seed": s, "budget": budget})
           print("matrix=" + json.dumps({"include": entries}))
-          # solutions.txt carries one block per (tau, k); the evaluator matrix
-          # indexes those, not the seeded search jobs.
-          print("evalmatrix=" + json.dumps(
-              {"subproblem": list(range(1, len(taus) * len(ks) + 1))}))
           PY
 
   search:
@@ -229,6 +231,8 @@ jobs:
     needs: [prepare, search]
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      evalmatrix: ${{ steps.index.outputs.evalmatrix }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -255,11 +259,23 @@ jobs:
           head -1 results/solutions.txt
           awk 'NR%3==0{n=split($0,a,","); printf "%s ", n}' results/solutions.txt
 
+      - name: Publish the sub-problem index
+        id: index
+        run: |
+          cat results/subproblems.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          subs = json.load(open("results/subproblems.json"))
+          print("evalmatrix=" + json.dumps(
+              {"subproblem": [s["index"] for s in subs]}))
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: submission
           path: |
             results/solutions.txt
+            results/subproblems.json
             results/submission.zip
           retention-days: 7
 
@@ -267,12 +283,14 @@ jobs:
   # which a competition run never commits — so the loop only closes if the
   # evaluator consumes the artifact this run just produced.
   official-eval:
-    needs: [prepare, aggregate]
+    needs: aggregate
     runs-on: ubuntu-latest
     timeout-minutes: 300
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.prepare.outputs.evalmatrix) }}
+      # Indices come from the file aggregate actually produced, so a missing or
+      # extra block cannot silently go unevaluated.
+      matrix: ${{ fromJSON(needs.aggregate.outputs.evalmatrix) }}
     steps:
       - uses: actions/checkout@v4
         with: { path: solution }
