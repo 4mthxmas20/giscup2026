@@ -10,7 +10,42 @@ Sources: `https://github.com/alowe/gis-cup-2026-evaluator` →
 
 ## Where to run
 
-All compute runs on a Codespace, not the local machine.
+| | Role |
+| --- | --- |
+| **GitHub Actions** | the compute: parallel search and batch verification |
+| **Codespace** | the control room: observation, tuning, debugging, manual fallback |
+| **Local machine** | never a compute environment — viewing and submitting only |
+
+### The main path: one dispatch
+
+```bash
+gh workflow run competition.yml \
+  -f dataset=data/competition.geojson \
+  -f taus=<from parameter file> -f ks=<from parameter file> \
+  -f R=<from probe> -f spacing=<from probe> \
+  -f budget_easy=900 -f budget_hard=7200 -f seeds_hard=3
+gh run watch
+```
+
+`prepare` builds the visibility table once into the Actions cache; `search`
+fans out one runner per `(tau, k, seed)`, each verifying its own configuration;
+`aggregate` picks the best seed per configuration and packages; `official-eval`
+re-checks the packaged `solutions.txt` with the organizers' evaluator. Download
+`submission` when it is green.
+
+Budgets are per configuration and run **concurrently**, so wall time is roughly
+one budget, not nine. Give the saturating configurations a short pass and the
+hard ones the hours (see *Spend the budget where it can move the ranking*).
+
+Two independent guards keep the shared inputs honest: a sha256 `manifest.txt`
+checked by every downstream job (fails loud), and the solver's own cache
+fingerprint over the dataset, R, spacing, eps and min-interval (fails safe by
+rebuilding). The cache key additionally hashes the geometry sources, so
+changing the sweep cannot silently reuse a table built by the old logic.
+
+### The fallback: Codespace, serial
+
+Use when Actions is unavailable or a run needs hands-on debugging.
 
 ```bash
 gh codespace create -R 4mthxmas20/giscup2026 -b main \
@@ -201,8 +236,12 @@ README with build and run instructions). Upload to EasyChair.
 ## Pre-flight checklist
 
 - [ ] τ/k taken from `competition-parameters.txt`, not assumed
-- [ ] `verify.py` prints `OK` for every config
-- [ ] Official evaluator workflow: `lost=0` on all nine
+- [ ] `prepare` saved the visibility cache (no `cache-hit` warning downstream)
+- [ ] every `search` job logged `loaded vis cache` — a job that recomputes it
+      is burning minutes for nothing
+- [ ] `verify.py` printed `OK` inside each search job
+- [ ] `aggregate` produced both `solutions.txt` and `subproblems.json`
+- [ ] Official evaluator: `lost=0` on every index in `subproblems.json`
 - [ ] Antenna count equals k exactly, with no duplicate coordinates
       (both asserted by `make_submission.py`)
 - [ ] Archive contains results **and** source with instructions
