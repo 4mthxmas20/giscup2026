@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <queue>
+#include <set>
 #include <thread>
 
 #include "geometry.hpp"
@@ -79,11 +80,16 @@ struct Candidate {
     uint32_t bld;
 };
 
+// `only` (when non-null) restricts generation to the flagged buildings, which
+// is how the refinement pass densifies just the region that still matters.
 static void genCandidates(const Dataset& ds, const BuildingGrid& bg,
                           double spacing, double eps,
-                          std::vector<Candidate>& out) {
+                          std::vector<Candidate>& out,
+                          const std::vector<uint8_t>* only = nullptr,
+                          bool quiet = false) {
     size_t skipped = 0;
     for (size_t bi = 0; bi < ds.blds.size(); bi++) {
+        if (only && !(*only)[bi]) continue;
         const auto& pts = ds.blds[bi].pts;
         size_t n = pts.size();
         auto outwardEdge = [&](size_t j) {  // outward normal of edge j->j+1 (CCW ring)
@@ -114,8 +120,9 @@ static void genCandidates(const Dataset& ds, const BuildingGrid& bg,
             }
         }
     }
-    std::fprintf(stderr, "candidates: %zu (skipped %zu inside a neighbor)\n",
-                 out.size(), skipped);
+    if (!quiet)
+        std::fprintf(stderr, "candidates: %zu (skipped %zu inside a neighbor)\n",
+                     out.size(), skipped);
 }
 
 // ---------------------------------------------------------------- CSR store
@@ -433,6 +440,99 @@ static void runGreedy(OptState& st, const std::vector<int>& ks, int nthreads,
             ksNext++;
         }
     }
+}
+
+// ---------------------------------------------------------------- refinement
+// Densify candidates only where they can still buy buildings: around footprints
+// whose coverage sits just short of tau. Halving `spacing` globally would
+// multiply the candidate set and slow every LNS iteration; aiming the extra
+// resolution at the margin keeps the scan cheap. Self-limiting by construction
+// — a saturated configuration has no near-miss buildings and refines nothing.
+static size_t refineCandidates(const Dataset& ds, const BuildingGrid& bg,
+                               const EdgeGrid& grid, const OptState& st,
+                               double band, double radius, double refSpacing,
+                               double eps, double R, double minIvLen,
+                               int nthreads, std::vector<Candidate>& cands,
+                               VisTable& vt) {
+    size_t nb = ds.blds.size();
+    struct Box { double x0, y0, x1, y1; };
+    std::vector<Box> box(nb);
+    for (size_t b = 0; b < nb; b++) {
+        Box& e = box[b];
+        e.x0 = e.y0 = 1e300;
+        e.x1 = e.y1 = -1e300;
+        for (Pt p : ds.blds[b].pts) {
+            e.x0 = std::min(e.x0, p.x); e.x1 = std::max(e.x1, p.x);
+            e.y0 = std::min(e.y0, p.y); e.y1 = std::max(e.y1, p.y);
+        }
+    }
+
+    std::vector<uint32_t> nearMiss;
+    for (size_t b = 0; b < nb; b++) {
+        double have = st.cov[b].len, want = st.need[b];
+        if (have < want && have >= (1.0 - band) * want)
+            nearMiss.push_back((uint32_t)b);
+    }
+    if (nearMiss.empty()) return 0;
+
+    // Bucket the near-miss footprints so the neighbourhood test stays linear.
+    double cell = std::max(radius, 1.0);
+    std::map<std::pair<long, long>, std::vector<uint32_t>> buckets;
+    auto cellOf = [&](double x, double y) {
+        return std::make_pair((long)std::floor(x / cell), (long)std::floor(y / cell));
+    };
+    for (uint32_t b : nearMiss) {
+        const Box& e = box[b];
+        buckets[cellOf((e.x0 + e.x1) / 2, (e.y0 + e.y1) / 2)].push_back(b);
+    }
+
+    std::vector<uint8_t> refine(nb, 0);
+    size_t nRegion = 0;
+    for (size_t b = 0; b < nb; b++) {
+        const Box& e = box[b];
+        auto [cx, cy] = cellOf((e.x0 + e.x1) / 2, (e.y0 + e.y1) / 2);
+        bool hit = false;
+        for (long dx = -1; dx <= 1 && !hit; dx++) {
+            for (long dy = -1; dy <= 1 && !hit; dy++) {
+                auto it = buckets.find({cx + dx, cy + dy});
+                if (it == buckets.end()) continue;
+                for (uint32_t m : it->second) {
+                    const Box& o = box[m];
+                    double ddx = std::max({o.x0 - e.x1, e.x0 - o.x1, 0.0});
+                    double ddy = std::max({o.y0 - e.y1, e.y0 - o.y1, 0.0});
+                    if (ddx * ddx + ddy * ddy <= radius * radius) { hit = true; break; }
+                }
+            }
+        }
+        if (hit) { refine[b] = 1; nRegion++; }
+    }
+
+    std::vector<Candidate> fresh;
+    genCandidates(ds, bg, refSpacing, eps, fresh, &refine, true);
+
+    // Vertices are regenerated unconditionally, so without this the refined set
+    // would duplicate existing points — and two antennas on one coordinate are
+    // counted once by the evaluator while still consuming k.
+    std::set<std::pair<double, double>> known;
+    for (const Candidate& c : cands) known.insert({c.p.x, c.p.y});
+    std::vector<Candidate> added;
+    for (const Candidate& c : fresh)
+        if (known.insert({c.p.x, c.p.y}).second) added.push_back(c);
+    if (added.empty()) return 0;
+
+    VisTable nvt;
+    batchVisibility(ds, grid, added, R, minIvLen, nthreads, nvt);
+
+    uint64_t base = vt.off.back();
+    for (size_t i = 1; i < nvt.off.size(); i++) vt.off.push_back(base + nvt.off[i]);
+    vt.data.insert(vt.data.end(), nvt.data.begin(), nvt.data.end());
+    cands.insert(cands.end(), added.begin(), added.end());
+
+    std::fprintf(stderr,
+                 "  refine: %zu near-miss buildings, %zu in region, "
+                 "+%zu candidates (total %zu)\n",
+                 nearMiss.size(), nRegion, added.size(), cands.size());
+    return added.size();
 }
 
 // Large-neighborhood search: ruin a handful of antennas and rebuild greedily.
@@ -759,6 +859,11 @@ int main(int argc, char** argv) {
     int nthreads = (int)std::thread::hardware_concurrency();
     bool testvis = false, witness = false;
     int probeN = 0;
+    // Refinement defaults: a building within 35% of its threshold is close
+    // enough to be worth chasing, and 150 m covers the sight lines that can
+    // realistically close such a gap.
+    bool refine = false;
+    double refineBand = 0.35, refineRadius = 150.0, refineSpacing = 2.0;
     double tvx = 0, tvy = 0, tvR = 0;
 
     for (int i = 2; i < argc; i++) {
@@ -776,6 +881,10 @@ int main(int argc, char** argv) {
         else if (is("--witness")) witness = true;
         else if (is("--probe")) probeN = std::atoi(argv[++i]);
         else if (is("--warmstart")) warmStart = argv[++i];
+        else if (is("--refine")) refine = true;
+        else if (is("--refineband")) refineBand = std::atof(argv[++i]);
+        else if (is("--refineradius")) refineRadius = std::atof(argv[++i]);
+        else if (is("--refinespacing")) refineSpacing = std::atof(argv[++i]);
         else if (is("--taus")) taus = parseList(argv[++i]);
         else if (is("--ks")) {
             ks.clear();
@@ -840,13 +949,13 @@ int main(int argc, char** argv) {
     auto t0 = Clock::now();
     std::vector<Candidate> cands;
     VisTable vt;
+    BuildingGrid bg;  // also needed by refinement, so build it either way
+    bg.build(ds, 100.0);
     if (!visCache.empty() &&
         loadVis(visCache, vt, cands, visFingerprint, R, spacing, eps, minIvLen)) {
         std::fprintf(stderr, "loaded vis cache: %zu candidates, %zu intervals\n",
                      cands.size(), vt.data.size());
     } else {
-        BuildingGrid bg;
-        bg.build(ds, 100.0);
         genCandidates(ds, bg, spacing, eps, cands);
         batchVisibility(ds, grid, cands, R, minIvLen, nthreads, vt);
         auto t1 = Clock::now();
@@ -905,8 +1014,24 @@ int main(int argc, char** argv) {
             int g0 = st.score;
             if (lsTime > 0) localSearch(st, lsTime, nthreads, 12345 + k);
             int g1 = st.score;
-            if (lnsTime > 0)
-                lnsSearch(st, lnsTime, nthreads, 999 + k, maxRuin, cands);
+            // With refinement on, the LNS budget is split: search once on the
+            // coarse set, densify around what nearly made it, then search again
+            // with the finer positions available.
+            double lns1 = refine ? lnsTime * 0.5 : lnsTime;
+            if (lns1 > 0) lnsSearch(st, lns1, nthreads, 999 + k, maxRuin, cands);
+            int g2 = st.score;
+            if (refine) {
+                std::vector<uint32_t> keep = st.selected;
+                size_t grew = refineCandidates(ds, bg, grid, st, refineBand,
+                                               refineRadius, refineSpacing, eps,
+                                               R, minIvLen, nthreads, cands, vt);
+                if (grew) {
+                    st.init(ds, vt, tau, 0.4);  // isSel must cover the new size
+                    for (uint32_t c : keep) st.add(c);
+                }
+                if (lnsTime - lns1 > 0)
+                    lnsSearch(st, lnsTime - lns1, nthreads, 777 + k, maxRuin, cands);
+            }
 
             // Incremental add/remove bookkeeping drives the whole search; a
             // drift here would silently optimize a phantom objective, so
@@ -922,9 +1047,15 @@ int main(int argc, char** argv) {
                     return 2;
                 }
             }
-            std::fprintf(stderr,
-                         "tau=%.2f k=%d: greedy %d (gamma=%.2f) -> ls %d -> lns %d / %zu\n",
-                         tau, k, g0, b.gamma, g1, st.score, ds.blds.size());
+            if (refine)
+                std::fprintf(stderr,
+                             "tau=%.2f k=%d: greedy %d (gamma=%.2f) -> ls %d "
+                             "-> lns %d -> refined %d / %zu\n",
+                             tau, k, g0, b.gamma, g1, g2, st.score, ds.blds.size());
+            else
+                std::fprintf(stderr,
+                             "tau=%.2f k=%d: greedy %d (gamma=%.2f) -> ls %d -> lns %d / %zu\n",
+                             tau, k, g0, b.gamma, g1, st.score, ds.blds.size());
 
             char path[512];
             std::snprintf(path, sizeof path, "%s/sol_t%g_k%d.txt", outDir.c_str(),
