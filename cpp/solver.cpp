@@ -864,6 +864,8 @@ int main(int argc, char** argv) {
     // realistically close such a gap.
     bool refine = false;
     double refineBand = 0.35, refineRadius = 150.0, refineSpacing = 2.0;
+    bool visOnly = false;      // build the cache and exit, for a shared CI stage
+    uint64_t seedBase = 0;     // vary to run independent searches in parallel
     double tvx = 0, tvy = 0, tvR = 0;
 
     for (int i = 2; i < argc; i++) {
@@ -882,6 +884,8 @@ int main(int argc, char** argv) {
         else if (is("--probe")) probeN = std::atoi(argv[++i]);
         else if (is("--warmstart")) warmStart = argv[++i];
         else if (is("--refine")) refine = true;
+        else if (is("--visonly")) visOnly = true;
+        else if (is("--seed")) seedBase = (uint64_t)std::strtoull(argv[++i], nullptr, 10);
         else if (is("--refineband")) refineBand = std::atof(argv[++i]);
         else if (is("--refineradius")) refineRadius = std::atof(argv[++i]);
         else if (is("--refinespacing")) refineSpacing = std::atof(argv[++i]);
@@ -968,6 +972,12 @@ int main(int argc, char** argv) {
                     minIvLen);
     }
 
+    if (visOnly) {
+        std::fprintf(stderr, "visonly: cache ready (%zu candidates, %zu intervals)\n",
+                     cands.size(), vt.data.size());
+        return 0;
+    }
+
     for (double tau : taus) {
         // greedy portfolio over gamma values; keep best picks per k
         struct Best {
@@ -1012,13 +1022,16 @@ int main(int argc, char** argv) {
             st.init(ds, vt, tau, 0.4);  // small progress term as LS tiebreak
             for (uint32_t c : b.picks) st.add(c);
             int g0 = st.score;
-            if (lsTime > 0) localSearch(st, lsTime, nthreads, 12345 + k);
+            if (lsTime > 0)
+                localSearch(st, lsTime, nthreads, seedBase * 1000003 + 12345 + k);
             int g1 = st.score;
             // With refinement on, the LNS budget is split: search once on the
             // coarse set, densify around what nearly made it, then search again
             // with the finer positions available.
             double lns1 = refine ? lnsTime * 0.5 : lnsTime;
-            if (lns1 > 0) lnsSearch(st, lns1, nthreads, 999 + k, maxRuin, cands);
+            if (lns1 > 0)
+                lnsSearch(st, lns1, nthreads, seedBase * 7919 + 999 + k, maxRuin,
+                          cands);
             int g2 = st.score;
             if (refine) {
                 std::vector<uint32_t> keep = st.selected;
@@ -1030,7 +1043,8 @@ int main(int argc, char** argv) {
                     for (uint32_t c : keep) st.add(c);
                 }
                 if (lnsTime - lns1 > 0)
-                    lnsSearch(st, lnsTime - lns1, nthreads, 777 + k, maxRuin, cands);
+                    lnsSearch(st, lnsTime - lns1, nthreads,
+                              seedBase * 6151 + 777 + k, maxRuin, cands);
             }
 
             // Incremental add/remove bookkeeping drives the whole search; a

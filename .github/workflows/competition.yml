@@ -1,0 +1,244 @@
+name: Competition run
+
+# Parallel competition-day pipeline.
+#
+#   prepare  — one runner: prepare.py, probe, build the visibility table
+#   search   — matrix: one runner per (tau, k, seed), each self-verifying
+#   aggregate— one runner: pick best per (tau, k), package the submission
+#
+# Large visibility tables go to the Actions cache (10 GB) rather than to
+# artifacts (500 MB on private repos, and the table can reach ~700 MB).
+# Artifacts carry only the small files.
+#
+# Integrity: prepare writes manifest.txt with a sha256 of every shared input;
+# every downstream job re-checks it. The solver independently fingerprints the
+# cache against the dataset and R/spacing/eps/minivlen, so a mismatched cache
+# is rebuilt rather than trusted. The two mechanisms fail differently — the
+# manifest fails loud, the fingerprint fails safe.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: Dataset path in the repo
+        default: data/GIS-cup-sample-dataset.geojson
+      taus:
+        description: Comma-separated tau values
+        default: "0.25,0.5,0.75"
+      ks:
+        description: Comma-separated k values
+        default: "50,500,1000"
+      R:
+        description: Visibility radius (m)
+        default: "1200"
+      spacing:
+        description: Candidate spacing (m)
+        default: "6"
+      budget_easy:
+        description: Search seconds for configs that saturate (low tau, high k)
+        default: "120"
+      budget_hard:
+        description: Search seconds for configs far from saturation
+        default: "600"
+      easy_taus:
+        description: Tau values treated as easy
+        default: "0.25"
+      seeds_hard:
+        description: Independent seeds per hard config (best wins)
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      cache_key: ${{ steps.key.outputs.key }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Build solver
+        run: make -C cpp
+
+      - name: Prepare buildings
+        run: |
+          mkdir -p results cache
+          python3 python/prepare.py "${{ inputs.dataset }}" results/buildings.txt
+
+      - name: Probe timing
+        run: cpp/solver results/buildings.txt --probe 2000 --R "${{ inputs.R }}" --spacing "${{ inputs.spacing }}"
+
+      - name: Compute cache key
+        id: key
+        run: |
+          H=$(sha256sum results/buildings.txt | cut -c1-32)
+          echo "key=vis-$H-R${{ inputs.R }}-S${{ inputs.spacing }}-v2" >> "$GITHUB_OUTPUT"
+
+      - name: Restore visibility cache
+        id: viscache
+        uses: actions/cache/restore@v4
+        with:
+          path: cache/vis.bin
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Build visibility table
+        if: steps.viscache.outputs.cache-hit != 'true'
+        run: |
+          cpp/solver results/buildings.txt --R "${{ inputs.R }}" \
+            --spacing "${{ inputs.spacing }}" --viscache cache/vis.bin --visonly
+          ls -la cache/vis.bin
+
+      - name: Save visibility cache
+        if: steps.viscache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: cache/vis.bin
+          key: ${{ steps.key.outputs.key }}
+
+      - name: Write manifest
+        run: |
+          cp "${{ inputs.dataset }}" results/dataset.geojson
+          cd results
+          # Paths are relative to results/ so every consumer checks it the same
+          # way regardless of where the artifact lands.
+          {
+            echo "# R=${{ inputs.R }} spacing=${{ inputs.spacing }}"
+            sha256sum dataset.geojson buildings.txt buildings.txt.ids.json
+          } > manifest.txt
+          cat manifest.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prep
+          path: |
+            results/dataset.geojson
+            results/buildings.txt
+            results/buildings.txt.ids.json
+            results/manifest.txt
+          retention-days: 7
+
+      - name: Plan the search matrix
+        id: plan
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          taus = [t.strip() for t in "${{ inputs.taus }}".split(",") if t.strip()]
+          ks = [k.strip() for k in "${{ inputs.ks }}".split(",") if k.strip()]
+          easy = {t.strip() for t in "${{ inputs.easy_taus }}".split(",") if t.strip()}
+          seeds_hard = int("${{ inputs.seeds_hard }}")
+          entries = []
+          for t in taus:
+              for k in ks:
+                  is_easy = t in easy
+                  budget = "${{ inputs.budget_easy }}" if is_easy else "${{ inputs.budget_hard }}"
+                  for s in range(1 if is_easy else seeds_hard):
+                      entries.append({"tau": t, "k": k, "seed": s, "budget": budget})
+          print("matrix=" + json.dumps({"include": entries}))
+          PY
+
+  search:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Build solver
+        run: make -C cpp
+
+      - uses: actions/download-artifact@v4
+        with: { name: prep, path: results }
+
+      - name: Verify manifest
+        run: |
+          cd results
+          grep -v '^#' manifest.txt | sha256sum -c -
+          echo "manifest OK"
+
+      - name: Restore visibility cache
+        id: viscache
+        uses: actions/cache/restore@v4
+        with:
+          path: cache/vis.bin
+          key: ${{ needs.prepare.outputs.cache_key }}
+
+      - name: Warn on cache miss
+        if: steps.viscache.outputs.cache-hit != 'true'
+        run: echo "::warning::visibility cache miss; this job will recompute it"
+
+      - name: Install shapely
+        run: pip install --quiet shapely
+
+      - name: Solve tau=${{ matrix.tau }} k=${{ matrix.k }} seed=${{ matrix.seed }}
+        run: |
+          mkdir -p cache
+          BUDGET=${{ matrix.budget }}
+          LS=$(( BUDGET / 3 )); [ "$LS" -gt 180 ] && LS=180
+          LNS=$(( BUDGET - LS ))
+          cpp/solver results/buildings.txt \
+            --R "${{ inputs.R }}" --spacing "${{ inputs.spacing }}" \
+            --viscache cache/vis.bin \
+            --taus "${{ matrix.tau }}" --ks "${{ matrix.k }}" \
+            --lstime "$LS" --lnstime "$LNS" --seed "${{ matrix.seed }}" \
+            --witness --out results
+
+      - name: Verify this configuration
+        run: |
+          python3 python/verify.py results/dataset.geojson results --samples 20 \
+            --configs "t${{ matrix.tau }}_k${{ matrix.k }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sol-t${{ matrix.tau }}-k${{ matrix.k }}-s${{ matrix.seed }}
+          path: |
+            results/sol_t${{ matrix.tau }}_k${{ matrix.k }}.txt
+            results/wit_t${{ matrix.tau }}_k${{ matrix.k }}.txt
+          retention-days: 7
+
+  aggregate:
+    needs: [prepare, search]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - uses: actions/download-artifact@v4
+        with: { name: prep, path: results }
+
+      - uses: actions/download-artifact@v4
+        with: { pattern: sol-*, path: sols }
+
+      - name: Verify manifest
+        run: |
+          cd results
+          grep -v '^#' manifest.txt | sha256sum -c -
+
+      - name: Pick best per configuration
+        run: python3 python/pick_best.py sols results
+
+      - name: Package
+        run: |
+          python3 python/make_submission.py results results/submission.zip
+          unzip -l results/submission.zip
+          head -1 results/solutions.txt
+          awk 'NR%3==0{n=split($0,a,","); printf "%s ", n}' results/solutions.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: submission
+          path: |
+            results/solutions.txt
+            results/submission.zip
+          retention-days: 7
