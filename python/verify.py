@@ -92,7 +92,8 @@ def union_len(ivs, per):
     return total
 
 
-def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng, ids):
+def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng, ids,
+                  drop_invalid=False):
     """Solver files identify buildings by 0-based index; `ids` maps those back
     to the dataset's own IDs."""
     sol = os.path.join(soldir, f"sol_{tag}.txt")
@@ -127,6 +128,7 @@ def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng, ids)
 
     n_cov_fail = 0
     n_vis_fail = 0
+    rejected = []
     n_checked_pts = 0
     valid = []
     for bid in claimed:
@@ -146,6 +148,7 @@ def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng, ids)
         cov = union_len([(t0, t1) for _, t0, t1 in ivs], per)
         if cov < tau * per:
             n_cov_fail += 1
+            rejected.append((ids[bid], "coverage", cov / per))
             continue
         ok = True
         for _ in range(nsamples):
@@ -158,6 +161,7 @@ def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng, ids)
             n_checked_pts += 1
             if penetration_blocked(q, p, tree, shrunk):
                 n_vis_fail += 1
+                rejected.append((ids[bid], "vis", t))
                 ok = False
                 break
         if ok:
@@ -168,6 +172,20 @@ def verify_config(gj_blds, tree, polys, shrunk, soldir, tag, nsamples, rng, ids)
     print(f"{status} {tag}: claimed {len(claimed)}, valid {len(valid)}, "
           f"cov_fail {n_cov_fail}, vis_fail {n_vis_fail}, "
           f"bad_antenna_pos {bad_pos}, sampled {n_checked_pts} pts")
+    # Naming the offenders is what makes a failure actionable — without it the
+    # only recourse is discarding the whole configuration.
+    for bid, why, where in rejected[:20]:
+        print(f"     rejected {tag} building {bid} ({why} at arc {where:.4f})")
+
+    if drop_invalid and len(valid) != len(claimed):
+        with open(sol) as f:
+            head = [f.readline(), f.readline()]
+        with open(sol, "w") as f:
+            f.writelines(head)
+            f.write(",".join(str(b) for b in valid) + "\n")
+        print(f"     rewrote {sol}: {len(claimed)} -> {len(valid)} claims")
+        return True   # the file now contains only what survived checking
+
     return bad_pos == 0 and n_cov_fail == 0 and n_vis_fail == 0
 
 
@@ -182,6 +200,10 @@ def main():
     ap.add_argument("--ids", default=None,
                     help="index -> ID map from prepare.py "
                          "(default: <soldir>/buildings.txt.ids.json)")
+    ap.add_argument("--drop-invalid", action="store_true",
+                    help="rewrite each sol file keeping only claims that passed; "
+                         "under-claiming costs one building, over-claiming is "
+                         "rejected by the organizers")
     args = ap.parse_args()
 
     ids_path = args.ids or os.path.join(args.soldir, "buildings.txt.ids.json")
@@ -203,7 +225,7 @@ def main():
     all_ok = True
     for tag in tags:
         all_ok &= verify_config(gj_blds, tree, polys, shrunk, args.soldir,
-                                tag, args.samples, rng, ids)
+                                tag, args.samples, rng, ids, args.drop_invalid)
     sys.exit(0 if all_ok else 1)
 
 
