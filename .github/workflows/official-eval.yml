@@ -53,7 +53,12 @@ jobs:
         run: |
           cp "$GITHUB_WORKSPACE/solution/scripts/official_eval.test.ts" \
              benchmarks/official_eval.test.ts
+          # The benchmark config caps a test at 900 s, which a large sub-problem
+          # blows past: 15k claimed buildings take well over 15 minutes to
+          # evaluate. competition.yml already raises this; this workflow was
+          # missed and only showed it once the dataset grew.
           npx vitest run --config vitest.benchmark.config.ts \
+            --testTimeout=7200000 \
             benchmarks/official_eval.test.ts --reporter=verbose
 
       - uses: actions/upload-artifact@v4
