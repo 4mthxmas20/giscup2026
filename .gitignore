@@ -10,3 +10,5 @@ results/*.viz.png
 results/wit_*.txt
 results/*.bin
 cpp/solver
+results/sol_*.txt
+results/buildings.txt*
