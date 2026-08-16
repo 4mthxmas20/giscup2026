@@ -37,6 +37,12 @@ on:
       minivlen:
         description: Drop visible intervals shorter than this (m)
         default: "0.02"
+      gammas:
+        description: >
+          Greedy surrogate weights. The portfolio picks whichever start scores
+          highest, but greedy score does not predict refined score at small k —
+          pass a single value to force a specific start.
+        default: "0.05,0.1,0.2,0.4,0.7,1.0,1.5"
       budget_easy:
         description: Search seconds for configs that saturate (low tau, high k)
         default: "120"
@@ -204,6 +210,7 @@ jobs:
           cpp/solver results/buildings.txt \
             --R "${{ inputs.R }}" --spacing "${{ inputs.spacing }}" \
             --minivlen "${{ inputs.minivlen }}" --viscache cache/vis.bin \
+            --gammas "${{ inputs.gammas }}" \
             --taus "${{ matrix.tau }}" --ks "${{ matrix.k }}" \
             --lstime "$LS" --lnstime "$LNS" --seed "${{ matrix.seed }}" \
             --witness --out results 2>&1 | tee solve.log
